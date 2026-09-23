@@ -33,7 +33,7 @@ model:
   hidden_size: 768
   speaker_dims: 1
   vae_codebook_size: 1024
-  audio_encoder: causal_conv
+  audio_encoder: causal_mel
   token_downsample_factor: 4
   num_heads: 4
   region_transformer_layers: 2
@@ -56,7 +56,7 @@ validation:
   validation_steps: 100
   test_steps: 200
   visualization: False
-  evaluation: False
+  evaluation: True
   wandb: False
 
 solver:

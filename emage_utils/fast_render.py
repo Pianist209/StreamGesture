@@ -303,9 +303,9 @@ def generate_silent_videos_no_gt(frames, vertices_all, faces, output_dir):
         os.remove(fn)
     return out_file
 
-def add_audio_to_video(silent_video_path, audio_path, output_video_path):
+def add_audio_to_video(silent_video_path, audio_path, output_video_path, audio_start_seconds=0.0):
     cmd = [
-        'ffmpeg','-y','-i', silent_video_path,'-i', audio_path,'-map','0:v','-map','1:a','-c:v','copy','-shortest',output_video_path
+        'ffmpeg','-y','-i', silent_video_path,'-ss', str(audio_start_seconds),'-i', audio_path,'-map','0:v','-map','1:a','-c:v','copy','-shortest',output_video_path
     ]
     try:
         subprocess.run(cmd, check=True)
@@ -404,7 +404,7 @@ def render_one_sequence_with_face(res_npz_path, output_dir, audio_path, model_fo
     os.remove(sfile)
     return final_clip
 
-def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True, extra_npz_path=None):
+def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True, extra_npz_path=None, audio_start_seconds=0.0):
     import smplx
     import torch
     data_np_body = np.load(res_npz_path, allow_pickle=True)
@@ -462,11 +462,11 @@ def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model
         sfile = generate_silent_videos_multi(frame_count, [vertices_all, vertices1_all, vertices2_all], faces, output_dir)
     base = os.path.splitext(os.path.basename(res_npz_path))[0]
     final_clip = os.path.join(output_dir, f"{base}.mp4")
-    add_audio_to_video(sfile, audio_path, final_clip)
+    add_audio_to_video(sfile, audio_path, final_clip, audio_start_seconds=audio_start_seconds)
     os.remove(sfile)
     return final_clip
 
-def render_one_sequence_no_gt(res_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True):
+def render_one_sequence_no_gt(res_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True, audio_start_seconds=0.0):
     import smplx
     import torch
     data_np_body = np.load(res_npz_path, allow_pickle=True)
@@ -492,7 +492,7 @@ def render_one_sequence_no_gt(res_npz_path, output_dir, audio_path, model_folder
     sfile = generate_silent_videos_no_gt(int(seconds*args['render_video_fps']), vertices_all, faces, output_dir)
     base = os.path.splitext(os.path.basename(res_npz_path))[0]
     final_clip = os.path.join(output_dir, f"{base}.mp4")
-    add_audio_to_video(sfile, audio_path, final_clip)
+    add_audio_to_video(sfile, audio_path, final_clip, audio_start_seconds=audio_start_seconds)
     os.remove(sfile)
     return final_clip
 
@@ -533,3 +533,4 @@ def render_one_sequence_face_only(res_npz_path, output_dir, audio_path, model_fo
     add_audio_to_video(sfile, audio_path, final_clip)
     os.remove(sfile)
     return final_clip
+

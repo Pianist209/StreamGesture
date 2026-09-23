@@ -1,4 +1,5 @@
 import json
+import math
 import torch
 from torch.utils import data
 import numpy as np
@@ -44,8 +45,8 @@ class BEAT2Dataset(data.Dataset):
         motion = self.normalize(motion, self.mean, self.std)
         
         audio, _ = librosa.load(data_item["audio_path"], sr=self.audio_sr)
-        sdx_audio = sdx * int((1 / SMPLX_FPS) * self.audio_sr)
-        edx_audio = edx * int((1 / SMPLX_FPS) * self.audio_sr)
+        sdx_audio = round(sdx * self.audio_sr / SMPLX_FPS)
+        edx_audio = sdx_audio + math.ceil((edx - sdx) * self.audio_sr / SMPLX_FPS)
         audio = audio[sdx_audio:edx_audio]
              
         motion_tensor = torch.from_numpy(motion).float()
@@ -73,8 +74,10 @@ class BEAT2DatasetEamge(BEAT2Dataset):
         motion = self.normalize(motion, self.mean, self.std)
         
         audio, _ = librosa.load(data_item["audio_path"], sr=self.audio_sr)
-        sdx_audio = sdx * int((1 / SMPLX_FPS) * self.audio_sr)
-        edx_audio = edx * int((1 / SMPLX_FPS) * self.audio_sr)
+        # Round the absolute start, not samples/frame; use a fixed duration so
+        # equal-length motion clips still collate into equal-length waveforms.
+        sdx_audio = round(sdx * self.audio_sr / SMPLX_FPS)
+        edx_audio = sdx_audio + math.ceil((edx - sdx) * self.audio_sr / SMPLX_FPS)
         audio = audio[sdx_audio:edx_audio]
              
         motion_tensor = torch.from_numpy(motion).float()
@@ -109,8 +112,8 @@ class BEAT2DatasetEamgeFootContact(BEAT2Dataset):
         motion = self.normalize(motion, self.mean, self.std)
         
         audio, _ = librosa.load(data_item["audio_path"], sr=self.audio_sr)
-        sdx_audio = sdx * int((1 / SMPLX_FPS) * self.audio_sr)
-        edx_audio = edx * int((1 / SMPLX_FPS) * self.audio_sr)
+        sdx_audio = round(sdx * self.audio_sr / SMPLX_FPS)
+        edx_audio = sdx_audio + math.ceil((edx - sdx) * self.audio_sr / SMPLX_FPS)
         audio = audio[sdx_audio:edx_audio]
              
         motion_tensor = torch.from_numpy(motion).float()

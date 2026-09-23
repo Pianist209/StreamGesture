@@ -558,9 +558,9 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x):
+    def forward(self, x, offset=0):
         freqs = torch.outer(
-            torch.arange(x.shape[-2], device=x.device, dtype=self.inv_freq.dtype),
+            torch.arange(offset, offset + x.shape[-2], device=x.device, dtype=self.inv_freq.dtype),
             self.inv_freq,
         )  # (T, head_dim/2)
         cos = freqs.cos()[None, None]
@@ -594,6 +594,21 @@ class SelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         return self.out(out.transpose(1, 2).reshape(bs, t, dim))
 
+    def forward_step(self, x, cache=None):
+        """One new position attends to all cached positions and itself."""
+        bs, _, dim = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = [a.view(bs, 1, self.nhead, -1).transpose(1, 2) for a in (q, k, v)]
+        offset = 0 if cache is None else cache[0].shape[-2]
+        if self.rope is not None:
+            q, k = self.rope(q, offset), self.rope(k, offset)
+        if cache is not None:
+            k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
+        # No future keys exist. is_causal=True with a single query would apply
+        # an upper-left mask and incorrectly hide most of the cached prefix.
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        return self.out(out.transpose(1, 2).reshape(bs, 1, dim)), (k, v)
+
 
 class CausalAudioCrossAttention(nn.Module):
     """Cross-attention from token positions to the 1:1-aligned causal audio tokens."""
@@ -616,6 +631,18 @@ class CausalAudioCrossAttention(nn.Module):
         q, k = self.rope(q), self.rope(k)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(out.transpose(1, 2).reshape(bs, t, dim))
+
+    def forward_step(self, x, audio, cache=None):
+        bs, _, dim = x.shape
+        q = self.q_proj(x).view(bs, 1, self.nhead, -1).transpose(1, 2)
+        k, v = self.kv_proj(audio).chunk(2, dim=-1)
+        k, v = [a.view(bs, 1, self.nhead, -1).transpose(1, 2) for a in (k, v)]
+        offset = 0 if cache is None else cache[0].shape[-2]
+        q, k = self.rope(q, offset), self.rope(k, offset)
+        if cache is not None:
+            k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        return self.out(out.transpose(1, 2).reshape(bs, 1, dim)), (k, v)
 
 
 class FeedForward(nn.Module):
@@ -644,6 +671,14 @@ class RegionBlock(nn.Module):
         x = x + self.audio_attn(self.norm2(x), audio)
         return x + self.ffn(self.norm3(x))
 
+    def forward_step(self, x, audio, cache=None):
+        self_cache, audio_cache = (None, None) if cache is None else cache
+        y, self_cache = self.self_attn.forward_step(self.norm1(x), self_cache)
+        x = x + y
+        y, audio_cache = self.audio_attn.forward_step(self.norm2(x), audio, audio_cache)
+        x = x + y
+        return x + self.ffn(self.norm3(x)), (self_cache, audio_cache)
+
 
 class FusionBlock(nn.Module):
     """Coordinates the four region streams: same-time region attention, causal
@@ -671,6 +706,20 @@ class FusionBlock(nn.Module):
         x = x + self.audio_attn(self.norm_audio(x), audio_rep)
         x = x + self.ffn(self.norm_ffn(x))
         return x.reshape(bs, r, n, d).permute(0, 2, 1, 3)
+
+    def forward_step(self, h, audio, cache=None):
+        bs, _, r, d = h.shape
+        time_cache, audio_cache = (None, None) if cache is None else cache
+        x = h[:, 0]
+        x = x + self.region_attn(self.norm_region(x))
+        x = x.reshape(bs * r, 1, d)
+        y, time_cache = self.time_attn.forward_step(self.norm_time(x), time_cache)
+        x = x + y
+        audio_rep = audio.unsqueeze(1).expand(bs, r, 1, d).reshape(bs * r, 1, d)
+        y, audio_cache = self.audio_attn.forward_step(self.norm_audio(x), audio_rep, audio_cache)
+        x = x + y
+        x = x + self.ffn(self.norm_ffn(x))
+        return x.reshape(bs, 1, r, d), (time_cache, audio_cache)
 
 
 def shift_tokens_with_bos(targets, bos_id):
@@ -739,24 +788,12 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             {part: nn.Linear(dim, codebook) for part in self.PARTS}
         )
 
-    def forward(self, audio, speaker_id, past_tokens, audio_token_start=0):
+    def forward(self, audio, speaker_id, past_tokens):
+        """Parallel teacher forcing over the complete BOS-prefixed sequence."""
         token_length = past_tokens[self.PARTS[0]].shape[1]
-
-        # past_tokens 对应全局 token 区间 [start, end)
-        start = int(audio_token_start)
-        end = start + token_length
-        if start < 0:
-            raise ValueError("audio_token_start must be non-negative")
-
-        # 先从完整音频前缀提取特征，保留原有 STFT 时间网格和卷积上下文，
-        # 再选择与 token 历史对应的音频 token（与滑动的历史窗口对齐）。
-        audio_all = self.audio_encoder(audio, target_tokens=end)  # (bs, end, dim) at 7.5Hz
-        if audio_all.shape[1] < end:
-            raise RuntimeError(
-                f"Audio tokens insufficient: need {end}, got {audio_all.shape[1]}"
-            )
-        audio_feat = audio_all[:, start:end]
-
+        audio_feat = self.audio_encoder(audio, target_tokens=token_length)
+        if audio_feat.shape[1] != token_length:
+            raise ValueError("Audio does not cover the complete token prefix")
         speaker = self.speaker_embedding(speaker_id).expand(-1, token_length, -1)
         region_features = []
         for part in self.PARTS:
@@ -764,77 +801,124 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             for block in self.region_branches[part]:
                 x = block(x, audio_feat)
             region_features.append(x)
-
-        h = torch.stack(region_features, dim=2)  # (bs, N, 4, dim)
+        h = torch.stack(region_features, dim=2)
         for block in self.fusion:
             h = block(h, audio_feat)
-
         return {
             f"cls_{part}": self.heads[part](h[:, :, region_id])
             for region_id, part in enumerate(self.PARTS)
         }
 
-    @torch.no_grad()
-    def inference(self, audio, speaker_id):
-        """One-token-per-step streaming generation over a token history.
+    def _token_step(self, audio_feat, speaker_id, past_tokens, cache=None):
+        """Predict one time position, retaining the complete prefix in KV caches."""
+        if cache is None:
+            cache = {
+                "regions": {part: [None] * len(self.region_branches[part]) for part in self.PARTS},
+                "fusion": [None] * len(self.fusion),
+            }
+        speaker = self.speaker_embedding(speaker_id)
+        regions = {}
+        features = []
+        for part in self.PARTS:
+            x = self.token_embedding[part](past_tokens[part]) + speaker
+            regions[part] = []
+            for block, block_cache in zip(self.region_branches[part], cache["regions"][part]):
+                x, block_cache = block.forward_step(x, audio_feat, block_cache)
+                regions[part].append(block_cache)
+            features.append(x)
+        h = torch.stack(features, dim=2)
+        fusion = []
+        for block, block_cache in zip(self.fusion, cache["fusion"]):
+            h, block_cache = block.forward_step(h, audio_feat, block_cache)
+            fusion.append(block_cache)
+        logits = {
+            f"cls_{part}": self.heads[part](h[:, :, region_id])
+            for region_id, part in enumerate(self.PARTS)
+        }
+        return logits, {"regions": regions, "fusion": fusion}
 
-        The history starts from BOS only; each step predicts the next block's
-        four codes from the token history and the audio received so far, then
-        appends the codes to the history. Decoded motion never feeds back into
-        the predictor; the caller decodes the returned tokens via the frozen
-        sVQ-VAE for output.
+    @torch.no_grad()
+    def stream_step(self, audio_chunk, speaker_id, state=None, motion_vq=None):
+        """Consume new mono samples (B, samples); return ready blocks and state.
+
+        Each result contains one token per region and, when motion_vq is supplied,
+        exactly token_downsample_factor decoded frames. Pass the returned state
+        into the next call. A new utterance starts with state=None.
+
+        Block B1 starts at frame 4 (for factor=4), after receiving audio B0.
+        start_frame/end_frame are on the original audio timeline. In eval mode,
+        cached inference matches a full causal-prefix forward pass.
+        """
+        if self.training:
+            raise RuntimeError("Call model.eval() before streaming inference")
+        if state is None:
+            state = {
+                "audio": None, "attention": None, "decoder": None, "step": 0,
+                "tokens": {
+                    part: torch.full((audio_chunk.shape[0], 1), self.bos_id,
+                                     dtype=torch.long, device=audio_chunk.device)
+                    for part in self.PARTS
+                },
+            }
+        audio_tokens, audio_state = self.audio_encoder.forward_stream(audio_chunk, state["audio"])
+        state = dict(state, audio=audio_state)
+        results = []
+        for i in range(audio_tokens.shape[1]):
+            logits, attention = self._token_step(
+                audio_tokens[:, i:i + 1], speaker_id, state["tokens"], state["attention"]
+            )
+            indices = {part: logits[f"cls_{part}"].argmax(dim=-1) for part in self.PARTS}
+            start_frame = (state["step"] + 1) * self.cfg.token_downsample_factor
+            result = {
+                "logits": logits, "indices": indices, "start_frame": start_frame,
+                "end_frame": start_frame + self.cfg.token_downsample_factor,
+            }
+            decoder = state["decoder"]
+            if motion_vq is not None:
+                result["motion"], decoder = motion_vq.decode_stream(indices, decoder)
+            results.append(result)
+            state = dict(state, attention=attention, decoder=decoder, tokens=indices,
+                         step=state["step"] + 1)
+        return results, state
+
+    def inference_stream(self, audio, speaker_id, motion_vq=None, num_tokens=None):
+        """Yield each forecast immediately; offline adapter for stream_step.
+
+        A recorded clip returns B1..B(N-1), excluding the initial ungenerated
+        block and forecasts beyond the clip. Live callers use stream_step.
         """
         block = self.cfg.token_downsample_factor
-        frames = audio.shape[1] * self.cfg.pose_fps // self.cfg.audio_sr
-        frames -= frames % block
-        total_blocks = frames // block
-        if total_blocks < 2:
+        if num_tokens is None:
+            total_blocks = audio.shape[1] * self.cfg.pose_fps // (block * self.cfg.audio_sr)
+            num_tokens = total_blocks - 1
+        if num_tokens < 1:
             raise ValueError("Audio must contain at least two motion blocks")
+        required = (num_tokens * block * self.cfg.audio_sr + self.cfg.pose_fps - 1) // self.cfg.pose_fps
+        if audio.shape[1] < required:
+            raise ValueError("Audio does not cover the requested token count")
+        state = None
+        start = 0
+        for step in range(num_tokens):
+            # Ceil the rational boundary: never emit before the interval ends.
+            end = ((step + 1) * block * self.cfg.audio_sr + self.cfg.pose_fps - 1) // self.cfg.pose_fps
+            results, state = self.stream_step(audio[:, start:end], speaker_id, state, motion_vq)
+            yield from results
+            start = end
 
-        # `history_window_tokens` is the max number of input positions kept;
-        # the window is a plain contiguous crop, so the BOS leaves naturally
-        # once the window slides past it.
-        history_window = int(getattr(self.cfg, "history_window_tokens", 32))
-        if history_window < 1:
-            raise ValueError("history_window_tokens must be positive")
-
-        bs = audio.shape[0]
-        past_tokens = {
-            part: torch.full((bs, 1), self.bos_id, dtype=torch.long, device=audio.device)
+    @torch.no_grad()
+    def inference(self, audio, speaker_id, num_tokens=None):
+        outputs = list(self.inference_stream(audio, speaker_id, num_tokens=num_tokens))
+        return {
+            f"cls_{part}": torch.cat([out["logits"][f"cls_{part}"] for out in outputs], dim=1)
             for part in self.PARTS
         }
-        logits = {f"cls_{part}": [] for part in self.PARTS}
-        # Step i forecasts B_{i+1} (i = 0..total_blocks-2).  Audio evidence covers
-        # up to (i+1)*block/30 s = the end of block i, i.e. "predict B_{i+1} sees
-        # 0..(i+1)*block/30".  This is the exact train-time logit j -> target B_{j+1}
-        # alignment from the shifted-future split (0ms lookahead).
-        for i in range(total_blocks - 1):
-            # 历史窗口滑动后，用全局音频 token 起点对齐，避免"音频还停在开头"的错位。
-            history_tokens = past_tokens[self.PARTS[0]].shape[1]
-            audio_token_end = i + 1
-            audio_token_start = audio_token_end - history_tokens
 
-            audio_end = round(
-                audio_token_end * block
-                * self.cfg.audio_sr / self.cfg.pose_fps
-            )
-
-            chunk_logits = self(
-                audio[:, :audio_end],
-                speaker_id,
-                past_tokens,
-                audio_token_start=audio_token_start,
-            )
-            for part in self.PARTS:
-                name = f"cls_{part}"
-                next_logit = chunk_logits[name][:, -1:]
-                logits[name].append(next_logit)
-                past_tokens[part] = torch.cat(
-                    (past_tokens[part], next_logit.argmax(dim=-1)), dim=1
-                )[:, -history_window:]
-
-        return {name: torch.cat(values, dim=1) for name, values in logits.items()}
-
-
+    @torch.no_grad()
+    def generate_motion(self, audio, speaker_id, motion_vq, num_tokens=None):
+        """Collect streamed decoder outputs for saving or offline evaluation."""
+        chunks = [out["motion"] for out in self.inference_stream(
+            audio, speaker_id, motion_vq=motion_vq, num_tokens=num_tokens
+        )]
+        return {key: torch.cat([chunk[key] for chunk in chunks], dim=1) for key in chunks[0]}
 
 

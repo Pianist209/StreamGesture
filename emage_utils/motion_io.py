@@ -108,6 +108,7 @@ def beat_format_save(
     expressions: np.ndarray = None,
     trans: np.ndarray = None,
     upsample: int = None,
+    start_time_seconds: float = 0.0,
 ):
     if betas is None:
         betas = np.zeros((motion_data.shape[0], 300), dtype=motion_data.dtype)
@@ -159,7 +160,8 @@ def beat_format_save(
         trans=trans,
         model='smplx2020',
         gender='neutral',
-        mocap_frame_rate=30
+        mocap_frame_rate=30,
+        start_time_seconds=start_time_seconds,
     )
 
 def beat_format_load(load_path: str, mask: list[bool] = None):

@@ -449,6 +449,8 @@ class CausalMelAudioEncoder(nn.Module):
             *[CausalBasicBlock(hidden_f, hidden_f, 5, 1) for _ in range(n_pyramid)]
         )
         self.post = nn.Linear(hidden_f, out_dim)
+        # Recompute only this bounded mel overlap when processing new frames.
+        self.mel_context = 2 + n_pyramid * 2 * (5 - 1)
 
     def forward(self, wav, target_tokens=None):
         # wav: (bs, T_audio) or (bs, 1, T_audio)
@@ -462,11 +464,11 @@ class CausalMelAudioEncoder(nn.Module):
             return torch.empty(bs_, 0, self.post.out_features, device=h.device)
 
         # exact integer timestamp of each mel frame's window end (in samples)
-        frame_ends = (torch.arange(1, T + 1, device=h.device) * self.hop_length
+        frame_ends = (torch.arange(T, device=h.device) * self.hop_length
                       + self.n_fft)                                    # (T,)
         # block end boundary for block i is 4*(i+1)/30 s; membership is
         # decided by strict <= via exact integer arithmetic (no float drift).
-        block_denom = 4 * self.sr
+        block_denom = self.token_downsample_factor * self.sr
         block_idx = ((frame_ends * self.pose_fps + block_denom - 1) // block_denom - 1).long()  # (T,)
         # The number of audio tokens is driven by the motion side (target_tokens),
         # not by how much audio was passed: keep only mel frames that fall inside
@@ -484,6 +486,57 @@ class CausalMelAudioEncoder(nn.Module):
         counts = h_t.new_zeros(N).scatter_add(0, block_idx, h_t.new_ones(T_valid)).clamp_min(1)  # (N,)
         pooled = summed / counts.view(1, N, 1)          # (bs, N, hidden_f)
         return self.post(pooled)                        # (bs, N, out_dim)
+
+    @torch.no_grad()
+    def forward_stream(self, wav, state=None):
+        """Consume mono samples and emit only complete audio-token intervals.
+
+        State retains the STFT remainder, finite convolution context and the
+        unfinished pool. Chunk boundaries do not reset the STFT time grid.
+        """
+        bs = wav.shape[0]
+        if state is None:
+            state = {
+                "samples": wav[:, :0], "received": 0, "mel_frames": 0,
+                "context": wav.new_empty(bs, self.mel.n_mels, 0),
+                "sums": wav.new_empty(bs, 0, self.hidden_f),
+                "counts": wav.new_empty(0), "emitted": 0,
+            }
+        samples = torch.cat((state["samples"], wav), dim=1)
+        received = state["received"] + wav.shape[1]
+        emitted = state["emitted"]
+        denom = self.token_downsample_factor * self.sr
+        complete = received * self.pose_fps // denom
+        sums, counts = state["sums"], state["counts"]
+        context = state["context"]
+        mel_frames = state["mel_frames"]
+        if samples.shape[1] >= self.n_fft:
+            new_mel = self.mel(samples)
+            n_new = new_mel.shape[-1]
+            mel_input = torch.cat((context, new_mel), dim=-1)
+            h = self.pyramid(self.proj(F.pad(mel_input, (2, 0))))
+            h = h[:, :, -n_new:].transpose(1, 2)
+            ends = (torch.arange(mel_frames, mel_frames + n_new, device=wav.device)
+                    * self.hop_length + self.n_fft)
+            indices = (ends * self.pose_fps + denom - 1) // denom - 1 - emitted
+            slots = max(complete - emitted, int(indices[-1].item()) + 1, counts.shape[0])
+            sums = F.pad(sums, (0, 0, 0, slots - sums.shape[1]))
+            counts = F.pad(counts, (0, slots - counts.shape[0]))
+            sums.scatter_add_(1, indices.view(1, -1, 1).expand(bs, -1, self.hidden_f), h)
+            counts.scatter_add_(0, indices, counts.new_ones(n_new))
+            context = mel_input[:, :, -self.mel_context:].clone()
+            samples = samples[:, n_new * self.hop_length:]
+            mel_frames += n_new
+        n_complete = complete - emitted
+        # The configured block must contain at least one complete STFT window.
+        if n_complete and (counts[:n_complete] == 0).any():
+            raise ValueError("Audio-token interval contains no complete STFT window")
+        tokens = self.post(sums[:, :n_complete] / counts[:n_complete].view(1, -1, 1))
+        return tokens, {
+            "samples": samples.clone(), "received": received, "mel_frames": mel_frames,
+            "context": context, "sums": sums[:, n_complete:].clone(),
+            "counts": counts[n_complete:].clone(), "emitted": complete,
+        }
 
 
 class MLP(nn.Module):

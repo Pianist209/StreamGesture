@@ -18,13 +18,7 @@ def inference(model, motion_vq, audio_path, device, save_folder, sr, pose_fps):
     audio = torch.from_numpy(audio).to(device).unsqueeze(0)
     speaker_id = torch.zeros(1,1).long().to(device)
     with torch.no_grad():
-        token_logits = model.inference(audio, speaker_id)
-        all_pred = motion_vq.decode(
-            face_index=token_logits["cls_face"].argmax(dim=-1),
-            upper_index=token_logits["cls_upper"].argmax(dim=-1),
-            hands_index=token_logits["cls_hands"].argmax(dim=-1),
-            lower_index=token_logits["cls_lower"].argmax(dim=-1),
-        )
+        all_pred = model.generate_motion(audio, speaker_id, motion_vq)
         
     motion_pred = all_pred["motion_axis_angle"]
     t = motion_pred.shape[1]
@@ -32,30 +26,53 @@ def inference(model, motion_vq, audio_path, device, save_folder, sr, pose_fps):
     face_pred = all_pred["expression"].cpu().numpy().reshape(t, -1)
     trans_pred = all_pred["trans"].cpu().numpy().reshape(t, -1)
     beat_format_save(os.path.join(save_folder, f"{os.path.splitext(os.path.basename(audio_path))[0]}_output.npz"),
-                     motion_pred, upsample=30//pose_fps, expressions=face_pred, trans=trans_pred)
+                     motion_pred, upsample=30//pose_fps, expressions=face_pred, trans=trans_pred,
+                     start_time_seconds=model.cfg.token_downsample_factor / pose_fps)
     return t
 
 def visualize_one(save_folder, audio_path, nopytorch3d=False, gt_npz=None, extra_npz=None):
     npz_path = os.path.join(save_folder, f"{os.path.splitext(os.path.basename(audio_path))[0]}_output.npz")
     motion_dict = np.load(npz_path, allow_pickle=True)
+    audio_start = float(motion_dict["start_time_seconds"])
+    # Reference files are on the original audio timeline. Crop each reference
+    # to the saved forecast's interval before side-by-side rendering.
+    def align_reference(path, label):
+        if path is None:
+            return None
+        with np.load(path, allow_pickle=True) as source:
+            data = dict(source)
+        source_start = float(data.get("start_time_seconds", 0.0))
+        first = round((audio_start - source_start) * 30)
+        if first < 0:
+            raise ValueError("Reference starts after the prediction")
+        for key in ("poses", "expressions", "trans"):
+            data[key] = data[key][first:first + motion_dict["poses"].shape[0]]
+        data["start_time_seconds"] = audio_start
+        aligned = npz_path.replace(".npz", f"_{label}_aligned.npz")
+        np.savez(aligned, **data)
+        return aligned
+    gt_npz = align_reference(gt_npz, "gt")
+    extra_npz = align_reference(extra_npz, "extra")
     if not nopytorch3d:
         from emage_utils.npz2pose import render2d
         v2d_face = render2d(motion_dict, (512, 512), face_only=True, remove_global=True)
         write_video(npz_path.replace(".npz", "_2dface.mp4"), v2d_face.permute(0, 2, 3, 1), fps=30)
-        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dface.mp4"), audio_path, npz_path.replace(".npz", "_2dface_audio.mp4"))
+        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dface.mp4"), audio_path, npz_path.replace(".npz", "_2dface_audio.mp4"), audio_start_seconds=audio_start)
         v2d_body = render2d(motion_dict, (720, 480), face_only=False, remove_global=True)
         write_video(npz_path.replace(".npz", "_2dbody.mp4"), v2d_body.permute(0, 2, 3, 1), fps=30)
-        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"))
+        fast_render.add_audio_to_video(npz_path.replace(".npz", "_2dbody.mp4"), audio_path, npz_path.replace(".npz", "_2dbody_audio.mp4"), audio_start_seconds=audio_start)
     if gt_npz is None:
         fast_render.render_one_sequence_no_gt(
             npz_path, os.path.dirname(npz_path), audio_path,
             model_folder="./emage_evaltools/smplx_models/",
+            audio_start_seconds=audio_start,
         )
     else:
         fast_render.render_one_sequence(
             npz_path, gt_npz, os.path.dirname(npz_path), audio_path,
             model_folder="./emage_evaltools/smplx_models/",
             extra_npz_path=extra_npz,
+            audio_start_seconds=audio_start,
         )
 
 def main():
