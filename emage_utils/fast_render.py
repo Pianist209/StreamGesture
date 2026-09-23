@@ -30,7 +30,7 @@ def create_pose_camera(angle_deg):
     angle_rad = deg_to_rad(angle_deg)
     return np.array([
         [1.0, 0.0, 0.0, 0.0],
-        [0.0, np.cos(angle_rad), -np.sin(angle_rad), 1.0],
+        [0.0, np.cos(angle_rad), -np.sin(angle_rad), 0.0],
         [0.0, np.sin(angle_rad), np.cos(angle_rad), 5.0],
         [0.0, 0.0, 0.0, 1.0]
     ])
@@ -47,9 +47,9 @@ def create_pose_light(angle_deg):
 def create_scene_with_mesh(vertices, faces, uniform_color, pose_camera, pose_light):
     trimesh_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_colors=uniform_color)
     mesh = pyrender.Mesh.from_trimesh(trimesh_mesh, smooth=True)
-    scene = pyrender.Scene(bg_color=[0, 0, 0, 0])
+    scene = pyrender.Scene(bg_color=[1.0, 1.0, 1.0, 1.0])
     scene.add(mesh)
-    camera = pyrender.OrthographicCamera(xmag=1.0, ymag=1.0)
+    camera = pyrender.OrthographicCamera(xmag=1.2, ymag=2.5)
     scene.add(camera, pose=pose_camera)
     light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=4.0)
     scene.add(light, pose=pose_light)
@@ -67,6 +67,19 @@ def do_render_one_frame(renderer, frame_idx, vertices, vertices1, faces):
         fig, _ = renderer.render(scene)
         figs.append(fig)
     return figs[0], figs[1]
+
+def do_render_one_frame_multi(renderer, frame_idx, vertices_group, faces):
+    if frame_idx % 100 == 0:
+        print('processed', frame_idx, 'frames')
+    uniform_color = [220, 220, 220, 255]
+    pose_camera = create_pose_camera(angle_deg=-2)
+    pose_light = create_pose_light(angle_deg=-30)
+    figs = []
+    for vertices in vertices_group:
+        scene = create_scene_with_mesh(vertices, faces, uniform_color, pose_camera, pose_light)
+        fig, _ = renderer.render(scene)
+        figs.append(fig)
+    return figs
 
 def do_render_one_frame_no_gt(renderer, frame_idx, vertices, faces):
     if frame_idx % 100 == 0:
@@ -86,6 +99,20 @@ def write_images_from_queue(fig_queue, output_dir, img_filetype):
         fid, fig1, fig2 = e
         fn = os.path.join(output_dir, f"frame_{fid}.{img_filetype}")
         merged_fig = np.hstack((fig1, fig2))
+        try:
+            imageio.imwrite(fn, merged_fig)
+        except Exception as ex:
+            print(f"Error writing image {fn}: {ex}")
+            raise ex
+
+def write_images_from_queue_multi(fig_queue, output_dir, img_filetype):
+    while True:
+        e = fig_queue.get()
+        if e is None:
+            break
+        fid, figs = e
+        fn = os.path.join(output_dir, f"frame_{fid}.{img_filetype}")
+        merged_fig = np.hstack(figs)
         try:
             imageio.imwrite(fn, merged_fig)
         except Exception as ex:
@@ -113,6 +140,14 @@ def render_frames_and_enqueue(fids, frame_vertex_pairs, faces, render_width, ren
         fig_queue.put((fid, fig1, fig2))
     renderer.delete()
 
+def render_frames_and_enqueue_multi(fids, frame_vertex_groups, faces, render_width, render_height, fig_queue):
+    fig_resolution = (render_width, render_height)
+    renderer = pyrender.OffscreenRenderer(*fig_resolution)
+    for idx, fid in enumerate(fids):
+        figs = do_render_one_frame_multi(renderer, fid, frame_vertex_groups[idx], faces)
+        fig_queue.put((fid, figs))
+    renderer.delete()
+
 def render_frames_and_enqueue_no_gt(fids, frame_vertex_pairs, faces, render_width, render_height, fig_queue):
     fig_resolution = (render_width, render_height)
     renderer = pyrender.OffscreenRenderer(*fig_resolution)
@@ -129,6 +164,19 @@ def sub_process_process_frame(subprocess_index, render_video_width, render_video
     fig_queue.put(None)
     t1 = time.time()
     thr = threading.Thread(target=write_images_from_queue, args=(fig_queue, output_dir, render_tmp_img_filetype))
+    thr.start()
+    thr.join()
+    t2 = time.time()
+    print(f"subprocess_index={subprocess_index} render={t1 - t0:.2f} all={t2 - t0:.2f}")
+
+def sub_process_process_frame_multi(subprocess_index, render_video_width, render_video_height, render_tmp_img_filetype, fids, frame_vertex_groups, faces, output_dir):
+    t0 = time.time()
+    print(f"subprocess_index={subprocess_index} begin_ts={t0}")
+    fig_queue = queue.Queue()
+    render_frames_and_enqueue_multi(fids, frame_vertex_groups, faces, render_video_width, render_video_height, fig_queue)
+    fig_queue.put(None)
+    t1 = time.time()
+    thr = threading.Thread(target=write_images_from_queue_multi, args=(fig_queue, output_dir, render_tmp_img_filetype))
     thr.start()
     thr.join()
     t2 = time.time()
@@ -161,6 +209,20 @@ def distribute_frames(frames, vertices_all, vertices1_all):
         sid += 1
     return subproc_frame_ids, subproc_vertices
 
+def distribute_frames_multi(frames, vertices_group):
+    sample_interval = max(1, int(30 // args['render_video_fps']))
+    subproc_frame_ids = [[] for _ in range(args['render_concurrent_num'])]
+    subproc_vertices = [[] for _ in range(args['render_concurrent_num'])]
+    sid = 0
+    for i in range(frames):
+        if i % sample_interval != 0:
+            continue
+        idx = sid % args['render_concurrent_num']
+        subproc_frame_ids[idx].append(sid)
+        subproc_vertices[idx].append(tuple(vertices[i] for vertices in vertices_group))
+        sid += 1
+    return subproc_frame_ids, subproc_vertices
+
 def distribute_frames_no_gt(frames, vertices_all):
     sample_interval = max(1, int(30 // args['render_video_fps']))
     subproc_frame_ids = [[] for _ in range(args['render_concurrent_num'])]
@@ -188,6 +250,28 @@ def generate_silent_videos(frames, vertices_all, vertices1_all, faces, output_di
                 verts[i],
                 faces,
                 output_dir
+            )
+            for i in range(args['render_concurrent_num'])
+        ])
+    out_file = os.path.join(output_dir, "silence_video.mp4")
+    convert_img_to_mp4(os.path.join(output_dir, f"frame_%d.{args['render_tmp_img_filetype']}"), out_file, args['render_video_fps'])
+    for fn in glob.glob(os.path.join(output_dir, f"*.{args['render_tmp_img_filetype']}")):
+        os.remove(fn)
+    return out_file
+
+def generate_silent_videos_multi(frames, vertices_group, faces, output_dir):
+    ids, verts = distribute_frames_multi(frames, vertices_group)
+    with multiprocessing.Pool(args['render_concurrent_num']) as pool:
+        pool.starmap(sub_process_process_frame_multi, [
+            (
+                i,
+                args['render_video_width'],
+                args['render_video_height'],
+                args['render_tmp_img_filetype'],
+                ids[i],
+                verts[i],
+                faces,
+                output_dir,
             )
             for i in range(args['render_concurrent_num'])
         ])
@@ -320,7 +404,7 @@ def render_one_sequence_with_face(res_npz_path, output_dir, audio_path, model_fo
     os.remove(sfile)
     return final_clip
 
-def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True):
+def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model_folder="/data/datasets/smplx_models/", model_type='smplx', gender='NEUTRAL_2020', ext='npz', num_betas=300, num_expression_coeffs=100, use_face_contour=False, use_matplotlib=False, remove_transl=True, extra_npz_path=None):
     import smplx
     import torch
     data_np_body = np.load(res_npz_path, allow_pickle=True)
@@ -349,11 +433,33 @@ def render_one_sequence(res_npz_path, gt_npz_path, output_dir, audio_path, model
         transl1 = transl1[0:1].repeat(n, 1)
     output1 = model(betas=beta1, transl=transl1, expression=expression1, jaw_pose=jaw_pose1, global_orient=pose1[:,:3], body_pose=pose1[:,3:21*3+3], left_hand_pose=pose1[:,25*3:40*3], right_hand_pose=pose1[:,40*3:55*3], leye_pose=pose1[:,69:72], reye_pose=pose1[:,72:75], return_verts=True)
     vertices1_all = output1["vertices"].cpu().numpy()
+    if extra_npz_path is not None:
+        extra_np_body = np.load(extra_npz_path, allow_pickle=True)
+        beta2 = torch.from_numpy(extra_np_body["betas"]).to(torch.float32).unsqueeze(0).cuda().repeat(n, 1)
+        expression2 = torch.from_numpy(extra_np_body["expressions"][:n]).to(torch.float32).cuda()
+        pose2 = torch.from_numpy(extra_np_body["poses"][:n]).to(torch.float32).cuda()
+        transl2 = torch.from_numpy(extra_np_body["trans"][:n]).to(torch.float32).cuda()
+        if remove_transl:
+            transl2 = transl2[0:1].repeat(n, 1)
+        output2 = model(
+            betas=beta2, transl=transl2, expression=expression2,
+            jaw_pose=pose2[:, 66:69], global_orient=pose2[:, :3],
+            body_pose=pose2[:, 3:21*3+3],
+            left_hand_pose=pose2[:, 25*3:40*3],
+            right_hand_pose=pose2[:, 40*3:55*3],
+            leye_pose=pose2[:, 69:72], reye_pose=pose2[:, 72:75],
+            return_verts=True,
+        )
+        vertices2_all = output2["vertices"].cpu().numpy()
     if args['debug']:
         seconds = 1
     else:
         seconds = vertices_all.shape[0]//30
-    sfile = generate_silent_videos(int(seconds*args['render_video_fps']), vertices_all, vertices1_all, faces, output_dir)
+    frame_count = int(seconds*args['render_video_fps'])
+    if extra_npz_path is None:
+        sfile = generate_silent_videos(frame_count, vertices_all, vertices1_all, faces, output_dir)
+    else:
+        sfile = generate_silent_videos_multi(frame_count, [vertices_all, vertices1_all, vertices2_all], faces, output_dir)
     base = os.path.splitext(os.path.basename(res_npz_path))[0]
     final_clip = os.path.join(output_dir, f"{base}.mp4")
     add_audio_to_video(sfile, audio_path, final_clip)

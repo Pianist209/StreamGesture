@@ -1,0 +1,75 @@
+wandb_project: 'streamable-emage'
+exp_name: 'causal_emage_audio_token'
+debug: False
+wandb_entity: ''
+wandb_key: ''
+output_dir: ./outputs/
+log_period: 1
+seed: 222
+# resume_from_checkpoint: './outputs/emage_streamable_audio_20260910-1622/checkpoints/last.bin'
+resume_from_checkpoint: ''
+test: False
+test_model_path: null
+
+data:
+  name_pyfile: 'datasets.beat2'
+  class_name: 'BEAT2DatasetEamge'
+  train_bs: 128
+  meta_paths:
+    - './datasets/data_json/beat2_s20_l64_speaker2.json'
+  test_meta_paths:
+    - './datasets/data_json/beat2_s20_l64_speaker2.json'
+  pose_norm: False
+
+model:
+  name_pyfile: 'models.emage_audio.modeling_emage_audio'
+  class_name: 'CausalEmageAudioTokenModel'
+  pose_fps: 30
+  pose_length: 64
+  pose_dims: 330
+  joint_mask: null
+  audio_sr: 16000
+  audio_f: 256
+  hidden_size: 768
+  speaker_dims: 1
+  vae_codebook_size: 1024
+  audio_encoder: causal_conv
+  token_downsample_factor: 4
+  num_heads: 4
+  region_transformer_layers: 2
+  fusion_layers: 2
+  cu: 1
+  cl: 1
+  ch: 1
+  cf: 1
+  streamable_vq:
+    upper_config: '../PantoMatrix-legacy/scripts/EMAGE_2024/configs/svq_upper_vq.yaml'
+    upper_checkpoint: '../PantoMatrix-legacy/outputs/streamable_vqvae_upper_vq/custom/0916_142558_svq_upper_vq/rec.bin'
+    hands_config: '../PantoMatrix-legacy/scripts/EMAGE_2024/configs/svq_hands_vq.yaml'
+    hands_checkpoint: '../PantoMatrix-legacy/outputs/streamable_vqvae_hands_vq/custom/0918_161219_svq_hands_vq/rec.bin'
+    lower_config: '../PantoMatrix-legacy/scripts/EMAGE_2024/configs/svq_lower_vq.yaml'
+    lower_checkpoint: '../PantoMatrix-legacy/outputs/streamable_vqvae_lower_vq/custom/0918_192732_svq_lower_vq/rec.bin'
+    face_config: '../PantoMatrix-legacy/scripts/EMAGE_2024/configs/svq_face_vq.yaml'
+    face_checkpoint: '../PantoMatrix-legacy/outputs/streamable_vqvae_face_vq/custom/0918_161350_svq_face_vq/rec.bin'
+
+validation:
+  validation_steps: 100
+  test_steps: 200
+  visualization: False
+  evaluation: False
+  wandb: False
+
+solver:
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: False
+  max_train_steps: 10000
+  max_grad_norm: 0.99
+  learning_rate: 1.5e-4
+  scale_lr: False
+  lr_warmup_steps: 0
+  lr_scheduler: 'constant'
+  use_8bit_adam: False
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 1.0e-8

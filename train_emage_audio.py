@@ -7,6 +7,7 @@ from datetime import datetime
 from tqdm import tqdm
 import importlib
 import copy
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 import librosa
 from pathlib import Path
 import json
@@ -26,7 +27,7 @@ from emage_utils.motion_io import beat_format_load, beat_format_save, MASK_DICT,
 import emage_utils.rotation_conversions as rc
 from emage_utils import fast_render
 from emage_utils.motion_rep_transfer import get_motion_rep_numpy
-from models.emage_audio import EmageVQVAEConv, EmageVAEConv, EmageVQModel, EmageAudioModel
+from models.emage_audio import CausalEmageAudioTokenModel, StreamableVQModel, shift_tokens_with_bos
 
 
 # ---------------------------------  train,val,test fn here --------------------------------- #
@@ -49,38 +50,15 @@ def inference_fn(cfg, model, device, test_path, save_path, **kwargs):
         audio = torch.from_numpy(audio).to(device).unsqueeze(0)
         speaker_id = torch.zeros(1,1).to(device).long()
 
-        # motion seed
-        motion_data = np.load(test_file["motion_path"], allow_pickle=True)
-        poses = torch.from_numpy(motion_data["poses"]).unsqueeze(0).to(device).float()
-        foot_contact = torch.from_numpy(np.load(test_file["motion_path"].replace("smplxflame_30", "footcontact").replace(".npz", ".npy"))).unsqueeze(0).to(device).float()
-        trans = torch.from_numpy(motion_data["trans"]).unsqueeze(0).to(device).float()
-        expression = torch.from_numpy(motion_data["expressions"]).unsqueeze(0).to(device).float()
-        bs, t, _ = poses.shape
-        poses_6d = rc.axis_angle_to_rotation_6d(poses.reshape(bs, t, -1, 3)).reshape(bs, t, -1)
-        masked_motion = torch.cat([poses_6d, trans, foot_contact], dim=-1) # bs t 337
-
-        # reconstrcution check
-        # latent_dict = motion_vq.map2latent(poses_6d, expression, tar_contact=foot_contact, tar_trans=trans)
-        # face_latent = latent_dict["face"]
-        # upper_latent = latent_dict["upper"]
-        # lower_latent = latent_dict["lower"]
-        # hands_latent = latent_dict["hands"]
-        # face_index, upper_index, lower_index, hands_index = None, None, None, None
-        latent_dict = actual_model.inference(audio, speaker_id, motion_vq, masked_motion=masked_motion)
-        face_latent = latent_dict["rec_face"] if cfg.lf > 0 and cfg.cf == 0 else None
-        upper_latent = latent_dict["rec_upper"] if cfg.lu > 0 and cfg.cu == 0 else None
-        hands_latent = latent_dict["rec_hands"] if cfg.lh > 0 and cfg.ch == 0 else None
-        lower_latent = latent_dict["rec_lower"] if cfg.ll > 0 and cfg.cl == 0 else None
-        # print(latent_dict["rec_face"].shape,latent_dict["cls_upper"].shape)
-        face_index = torch.max(F.log_softmax(latent_dict["cls_face"], dim=2), dim=2)[1] if cfg.cf > 0 else None
-        upper_index = torch.max(F.log_softmax(latent_dict["cls_upper"], dim=2), dim=2)[1] if cfg.cu > 0 else None
-        hands_index = torch.max(F.log_softmax(latent_dict["cls_hands"], dim=2), dim=2)[1] if cfg.ch > 0 else None
-        lower_index = torch.max(F.log_softmax(latent_dict["cls_lower"], dim=2), dim=2)[1] if cfg.cl > 0 else None
-
+        # The predictor conditions on its own token history (starting from BOS);
+        # no seed motion or motion feedback is used.
+        token_logits = actual_model.inference(audio, speaker_id)
         motion_all = motion_vq.decode(
-            face_latent=face_latent, upper_latent=upper_latent, lower_latent=lower_latent, hands_latent=hands_latent,
-            face_index=face_index, upper_index=upper_index, lower_index=lower_index, hands_index=hands_index,
-            get_global_motion=True, ref_trans=trans[:,0])
+            face_index=token_logits["cls_face"].argmax(dim=-1),
+            upper_index=token_logits["cls_upper"].argmax(dim=-1),
+            hands_index=token_logits["cls_hands"].argmax(dim=-1),
+            lower_index=token_logits["cls_lower"].argmax(dim=-1),
+        )
        
         motion_pred = motion_all["motion_axis_angle"]
         t = motion_pred.shape[1]
@@ -100,16 +78,6 @@ def inference_fn(cfg, model, device, test_path, save_path, **kwargs):
     time_cost = time.time() - start_time
     print(f"\n cost {time_cost:.2f} seconds to generate {total_length / cfg.pose_fps:.2f} seconds of motion")
     return test_list, save_list
-
-def get_mask(mask, ratio):
-    pass
-
-def get_rec_loss(motion_pred, motion_gt, lu, ll, lh, lf):
-    rec_loss_upper = lu * F.mse_loss(motion_pred["rec_upper"], motion_gt["upper"])
-    rec_loss_lower = ll * F.mse_loss(motion_pred["rec_lower"], motion_gt["lower"])
-    rec_loss_hands = lh * F.mse_loss(motion_pred["rec_hands"], motion_gt["hands"])
-    rec_loss_face = lf * F.mse_loss(motion_pred["rec_face"], motion_gt["face"])
-    return rec_loss_upper+rec_loss_lower+rec_loss_hands+rec_loss_face
 
 def get_cls_loss(motion_pred, motion_gt, cu, cl, ch, cf, ClsFn):
     ClsFn = ClsFn.to(motion_pred["cls_upper"].device)
@@ -138,47 +106,45 @@ def train_val_fn(cfg, batch, model, device, mode="train", **kwargs):
     motion_gt = batch["motion"].to(device)
     audio = batch["audio"].to(device)
     expressions_gt = batch["expressions"].to(device)
-    trans = batch["trans"].to(device)
-    foot_contact = batch["foot_contact"].to(device)
-
     bs, t, jc = motion_gt.shape
     j = jc // 3
     speaker_id = torch.zeros(bs,1).to(device).long()
     motion_gt = rc.axis_angle_to_rotation_6d(motion_gt.reshape(bs,t,j,3)).reshape(bs, t, j*6)
    
-    latent_index_dict = motion_vq.map2index(motion_gt, expressions_gt, tar_contact = foot_contact, tar_trans = trans)
-    latent_dict = motion_vq.map2latent(motion_gt, expressions_gt, tar_contact = foot_contact, tar_trans = trans)
-    masked_motion = torch.cat([motion_gt, trans, foot_contact], dim=-1)
-    # forward use audio
-    mask = torch.ones_like(masked_motion).to(device)
-    mask[:, :cfg.model.seed_frames] = 0
-    
-    motion_pred = model(audio, speaker_id, masked_motion=masked_motion, mask=mask, use_audio=True)
+    # Stage-2: predict the shifted future sequence, conditioned on past tokens.
+    # target = the 4-frame-shifted future (B1..B15) encoded as one VQ stream;
+    # the model input is the right-shifted target tokens with a BOS prepended
+    # (teacher forcing).
+    factor = cfg.model.token_downsample_factor
+    future_motion = motion_gt[:, factor:]
+    future_expr = expressions_gt[:, factor:]
+    # future must line up to whole VQ streams (each token = `factor` frames).
+    assert future_motion.shape[1] % factor == 0, f"future_motion length {future_motion.shape[1]} not divisible by {factor}"
+    latent_index_dict = motion_vq.map2index(future_motion, future_expr)
+    full_inputs = shift_tokens_with_bos(latent_index_dict, cfg.model.vae_codebook_size)
+
+    # Train on a random contiguous sub-window of the full shifted sequence so
+    # training covers the same window configurations inference sees: windows
+    # that still contain the BOS (start=0), slid windows without BOS (start>0),
+    # and varying history lengths. Middle windows keep their real predecessor
+    # tokens; no new BOS is inserted. Audio is sliced to the same positions
+    # inside the model via audio_token_start.
+    n_tokens = full_inputs["face"].shape[1]
+    start = random.randint(0, n_tokens - 1) if mode == "train" else 0
+    past_tokens = {part: tokens[:, start:] for part, tokens in full_inputs.items()}
+    window_targets = {part: tokens[:, start:] for part, tokens in latent_index_dict.items()}
+    motion_pred = model(audio, speaker_id, past_tokens, audio_token_start=start)
     loss_dict = {
-        "rec_seed": get_rec_loss(motion_pred, latent_dict, cfg.model.lu, cfg.model.ll, cfg.model.lh, cfg.model.lf),
-        "cls_seed": get_cls_loss(motion_pred, latent_index_dict, cfg.model.cu, cfg.model.cl, cfg.model.ch, cfg.model.cf, kwargs["ClsFn"]),
+        "cls": get_cls_loss(motion_pred, window_targets, cfg.model.cu, cfg.model.cl, cfg.model.ch, cfg.model.cf, kwargs["ClsFn"]),
     }
-  
-    # forward use randon mask and audio
-    mask_ratio = (kwargs["iteration"]/135*400) * 0.95 + 0.05  
-    mask = torch.rand(bs, t, cfg.model.pose_dims+3+4) < mask_ratio
-    mask = mask.float().to(device)
-    motion_pred_random_audio = model(audio, speaker_id, masked_motion=masked_motion, mask=mask, use_audio=True)
-    loss_dict["rec_audio"] = get_rec_loss(motion_pred_random_audio, latent_dict, cfg.model.lu, cfg.model.ll, cfg.model.lh, cfg.model.lf)
-    loss_dict["cls_audio"] = get_cls_loss(motion_pred_random_audio, latent_index_dict, cfg.model.cu, cfg.model.cl, cfg.model.ch, cfg.model.cf, kwargs["ClsFn"])
-  
-    # forward use random mask
-    motion_pred_random_mask = model(audio, speaker_id, masked_motion=masked_motion, mask=mask, use_audio=False)
-    loss_dict["rec_mask"] = get_rec_loss(motion_pred_random_mask, latent_dict, cfg.model.lu, cfg.model.ll, cfg.model.lh, cfg.model.lf)
-    loss_dict["cls_mask"] = get_cls_loss(motion_pred_random_mask, latent_index_dict, cfg.model.cu, cfg.model.cl, cfg.model.ch, cfg.model.cf, kwargs["ClsFn"])
     
     all_loss = sum(loss_dict.values())
     loss_dict["all"] = all_loss
   
     if mode == "train":
+        all_loss.backward()
         if cfg.solver.max_grad_norm > 0:
           torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.solver.max_grad_norm)
-        all_loss.backward()
         kwargs["optimizer"].step()
         kwargs["lr_scheduler"].step()
 
@@ -187,20 +153,15 @@ def train_val_fn(cfg, batch, model, device, mode="train", **kwargs):
         _, cls_upper =  torch.max(F.log_softmax(motion_pred["cls_upper"], dim=2), dim=2)
         _, cls_hands =  torch.max(F.log_softmax(motion_pred["cls_hands"], dim=2), dim=2)
         _, cls_lower =  torch.max(F.log_softmax(motion_pred["cls_lower"], dim=2), dim=2)
-        face_latent = motion_pred["rec_face"] if cfg.model.lf > 0 and cfg.model.cf == 0 else None
-        upper_latent = motion_pred["rec_upper"] if cfg.model.lu > 0 and cfg.model.cu == 0 else None
-        hands_latent = motion_pred["rec_hands"] if cfg.model.lh > 0 and cfg.model.ch == 0 else None
-        lower_latent = motion_pred["rec_lower"] if cfg.model.ll > 0 and cfg.model.cl == 0 else None
-        face_index = cls_face if cfg.model.cf > 0 else None
-        upper_index = cls_upper if cfg.model.cu > 0 else None
-        hands_index = cls_hands if cfg.model.ch > 0 else None
-        lower_index = cls_lower if cfg.model.cl > 0 else None
         decode_dict = motion_vq.decode(
-            face_latent=face_latent, upper_latent=upper_latent, lower_latent=lower_latent, hands_latent=hands_latent,
-            face_index=face_index, upper_index=upper_index, lower_index=lower_index, hands_index=hands_index,)
-        motion_pred_rot6d = decode_dict["all_motion4inference"][:, :, :-7]
-        # cache feature for evaluation
-        kwargs["fgd_evaluator"].update(motion_pred_rot6d, motion_gt)
+            face_index=cls_face,
+            upper_index=cls_upper,
+            hands_index=cls_hands,
+            lower_index=cls_lower,
+        )
+        motion_pred_rot6d = decode_dict["motion_rot6d"]
+        # compare against the same shifted future that is being predicted
+        kwargs["fgd_evaluator"].update(motion_pred_rot6d, future_motion)
     return loss_dict
 
 
@@ -226,22 +187,22 @@ def main(cfg):
             config=OmegaConf.to_container(cfg)
         )
 
-    # init
-    face_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/face").to(device)
-    upper_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/upper").to(device)
-    lower_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/lower").to(device)
-    hands_motion_vq = EmageVQVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/hands").to(device)
-    global_motion_ae = EmageVAEConv.from_pretrained("H-Liu1997/emage_audio", subfolder="emage_vq/global").to(device)
-    motion_vq = EmageVQModel(
-      face_model=face_motion_vq, upper_model=upper_motion_vq,
-      lower_model=lower_motion_vq, hands_model=hands_motion_vq,
-      global_model=global_motion_ae).to(device)
+    motion_vq = StreamableVQModel.from_config(cfg.model).to(device)
     for param in motion_vq.parameters():
         param.requires_grad = False
     motion_vq.eval()
+    # The predictor uses one shared vae_codebook_size for all four heads, which
+    # is only valid if the four VQ codebooks are actually the same size.
+    for part in ("face", "upper", "hands", "lower"):
+        n_tokens = getattr(motion_vq, f"vq_model_{part}").quantizer.num_tokens
+        if n_tokens != cfg.model.vae_codebook_size:
+            raise ValueError(
+                f"vq_model_{part} codebook size {n_tokens} != "
+                f"model.vae_codebook_size {cfg.model.vae_codebook_size}"
+            )
     
     if cfg.test:
-        model = EmageAudioModel.from_pretrained("/content/drive/MyDrive/weights/emage3/best").to(device) 
+        model = CausalEmageAudioTokenModel.from_pretrained(cfg.test_model_path).to(device)
     else:
         model = init_hf_class(cfg.model.name_pyfile, cfg.model.class_name, cfg.model).to(device)
   
@@ -323,8 +284,8 @@ def main(cfg):
                 with torch.no_grad():
                     test_list, save_list = inference_fn(cfg.model, model, device, cfg.data.test_meta_paths, test_save_path, motion_vq=motion_vq)
                 if cfg.validation.evaluation:
-                    metrics = evaluation_fn([True]*55, test_list, save_list, fgd_evaluator, bc_evaluator, l1div_evaluator, device, lvd_evaluator, mse_evaluator)
-                if cfg.validation.visualization: visualization_fn(save_list, test_save_path, test_list, only_check_one=True)
+                    metrics = evaluation_fn([True]*55, test_list, save_list, fgd_evaluator, bc_evaluator, l1div_evaluator, device, lvd_evaluator, mse_evaluator, factor=cfg.model.token_downsample_factor)
+                if cfg.validation.visualization: visualization_fn(save_list, test_save_path, test_list, only_check_one=True, factor=cfg.model.token_downsample_factor)
                 if cfg.validation.evaluation: best_fgd_test, best_fgd_iteration_test =  log_test(model, metrics, iteration, best_fgd_test, best_fgd_iteration_test, cfg, local_rank, experiment_ckpt_dir, test_save_path)
                 if cfg.test: return 0
 
@@ -368,7 +329,10 @@ def main(cfg):
 
 
 # ---------------------------------  utils fn here --------------------------------- #
-def evaluation_fn(joint_mask, gt_list, pred_list, fgd_evaluator, bc_evaluator, l1_evaluator, device, lvd_evaluator, mse_evaluator):
+def evaluation_fn(joint_mask, gt_list, pred_list, fgd_evaluator, bc_evaluator, l1_evaluator, device, lvd_evaluator, mse_evaluator, factor=4):
+    # The predictor's first generated block is B1 (frame `factor` of the GT
+    # timeline), so shift GT and audio by `factor` frames to align with the
+    # saved predictions.
     fgd_evaluator.reset()
     bc_evaluator.reset()
     l1_evaluator.reset()
@@ -385,9 +349,9 @@ def evaluation_fn(joint_mask, gt_list, pred_list, fgd_evaluator, bc_evaluator, l
         gt_dict = beat_format_load(test_file["motion_path"], joint_mask)
         pred_dict = beat_format_load(pred_file["motion_path"], joint_mask)
 
-        motion_gt = gt_dict["poses"]
+        motion_gt = gt_dict["poses"][factor:]
         motion_pred = pred_dict["poses"]
-        expressions_gt = gt_dict["expressions"]
+        expressions_gt = gt_dict["expressions"][factor:]
         expressions_pred = pred_dict["expressions"]
         betas = gt_dict["betas"]
         # motion_gt = recover_from_mask(motion_gt, joint_mask) # t1*165
@@ -403,7 +367,7 @@ def evaluation_fn(joint_mask, gt_list, pred_list, fgd_evaluator, bc_evaluator, l
         motion_position_pred = get_motion_rep_numpy(motion_pred, device=device, betas=betas)["position"] # t*55*3
         motion_position_pred = motion_position_pred.reshape(t, -1)
         # ignore the start and end 2s, this may for beat dataset only
-        audio_beat = bc_evaluator.load_audio(test_file["audio_path"], t_start=2 * 16000, t_end=int((t-60)/30*16000))
+        audio_beat = bc_evaluator.load_audio(test_file["audio_path"], t_start=int((60 + factor) / 30 * 16000), t_end=int((t - 60 + factor) / 30 * 16000))
         motion_beat = bc_evaluator.load_motion(motion_position_pred, t_start=60, t_end=t-60, pose_fps=30, without_file=True)
         bc_evaluator.compute(audio_beat, motion_beat, length=t-120, pose_fps=30)
         # audio_beat = bc_evaluator.load_audio(test_file["audio_path"], t_start=0 * 16000, t_end=int((t-0)/30*16000))
@@ -432,7 +396,7 @@ def evaluation_fn(joint_mask, gt_list, pred_list, fgd_evaluator, bc_evaluator, l
     metrics["mse"] = mse_evaluator.avg()
     return metrics
 
-def visualization_fn(pred_list, save_path, gt_list=None, only_check_one=True):
+def visualization_fn(pred_list, save_path, gt_list=None, only_check_one=True, factor=4):
     if gt_list is None: # single visualization
         for i in range(len(pred_list)):
             fast_render.render_one_sequence(
@@ -443,6 +407,8 @@ def visualization_fn(pred_list, save_path, gt_list=None, only_check_one=True):
             )
             if only_check_one: break
     else: # paired visualization, pad the translation
+        # The prediction starts at GT frame `factor` (first generated block is
+        # B1), so trim the GT by `factor` frames to align the two timelines.
         for i in range(len(pred_list)):
             npz_pred = np.load(pred_list[i]["motion_path"], allow_pickle=True)
             gt_file = [item for item in gt_list if item["video_id"] == pred_list[i]["video_id"]][0]
@@ -450,7 +416,7 @@ def visualization_fn(pred_list, save_path, gt_list=None, only_check_one=True):
                 print(f"Missing prediction for {pred_list[i]['video_id']}")
                 continue
             npz_gt = np.load(gt_file["motion_path"], allow_pickle=True)
-            t  = npz_gt["poses"].shape[0]
+            t = min(npz_pred["poses"].shape[0], npz_gt["poses"].shape[0] - factor)
             np.savez(
                 os.path.join(save_path, f"{pred_list[i]['video_id']}_transpad.npz"),
                 betas=npz_pred['betas'][:t],
@@ -461,9 +427,20 @@ def visualization_fn(pred_list, save_path, gt_list=None, only_check_one=True):
                 gender='neutral',
                 mocap_frame_rate=30,
             )
+            gt_trimmed_path = os.path.join(save_path, f"{pred_list[i]['video_id']}_gt_trimmed.npz")
+            np.savez(
+                gt_trimmed_path,
+                betas=npz_gt['betas'],
+                poses=npz_gt['poses'][factor:factor + t],
+                expressions=npz_gt['expressions'][factor:factor + t],
+                trans=npz_gt["trans"][factor:factor + t],
+                model='smplx2020',
+                gender='neutral',
+                mocap_frame_rate=30,
+            )
             fast_render.render_one_sequence(
                 os.path.join(save_path, f"{pred_list[i]['video_id']}_transpad.npz"),
-                gt_file["motion_path"],
+                gt_trimmed_path,
                 save_path,
                 pred_list[i]["audio_path"],
                 model_folder="./evaluation/smplx_models/",
@@ -600,10 +577,16 @@ def init_env():
     with open(os.path.join(sanity_check_dir, f'{config.exp_name}.yaml'), 'w') as f:
         OmegaConf.save(config, f)
     current_dir = Path.cwd()
-    for py_file in current_dir.rglob('*.py'):
-        dest_path = Path(sanity_check_dir) / py_file.relative_to(current_dir)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy(py_file, dest_path)
+    output_dir = Path(config.output_dir).resolve()
+    for root, dirs, files in os.walk(current_dir):
+        root_path = Path(root)
+        dirs[:] = [name for name in dirs if (root_path / name).resolve() != output_dir]
+        for name in files:
+            if name.endswith('.py'):
+                py_file = root_path / name
+                dest_path = Path(sanity_check_dir) / py_file.relative_to(current_dir)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(py_file, dest_path)
     return config
 
 if __name__ == "__main__":

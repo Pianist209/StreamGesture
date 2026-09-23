@@ -5,7 +5,7 @@ import math
 import copy
 from transformers import PreTrainedModel
 from .configuration_emage_audio import EmageAudioConfig, EmageVQVAEConvConfig, EmageVAEConvConfig
-from .processing_emage_audio import Quantizer, VQEncoderV5, VQDecoderV5, WavEncoder, MLP, PeriodicPositionalEncoding, VQEncoderV6, recover_from_mask_ts, rotation_6d_to_axis_angle, velocity2position, axis_angle_to_rotation_6d, rotation_6d_to_matrix, matrix_to_axis_angle, axis_angle_to_matrix, matrix_to_rotation_6d
+from .processing_emage_audio import Quantizer, VQEncoderV5, VQDecoderV5, WavEncoder, CausalWavEncoder, CausalMelAudioEncoder, MLP, PeriodicPositionalEncoding, VQEncoderV6, recover_from_mask_ts, rotation_6d_to_axis_angle, velocity2position, axis_angle_to_rotation_6d, rotation_6d_to_matrix, matrix_to_axis_angle, axis_angle_to_matrix, matrix_to_rotation_6d
 
 
 def inverse_selection_tensor(filtered_t, selection_array, n):
@@ -490,10 +490,350 @@ class EmageAudioModel(PreTrainedModel):
         }
 
 
+class StreamableAudioTokenModel(PreTrainedModel):
+    """Audio-to-token predictor for the 4x-downsampled streamable VQ-VAEs.
+
+    It predicts one code for every four 30 FPS motion frames from causal audio
+    features and causal token attention.
+    """
+
+    config_class = EmageAudioConfig
+    base_model_prefix = "streamable_audio_token"
+
+    def __init__(self, config: EmageAudioConfig):
+        super().__init__(config)
+        self.cfg = config
+        self.audio_encoder = CausalWavEncoder(self.cfg.audio_f)
+        self.token_downsample = nn.Conv1d(
+            self.cfg.audio_f,
+            self.cfg.hidden_size,
+            kernel_size=self.cfg.token_downsample_factor,
+            stride=self.cfg.token_downsample_factor,
+        )
+        self.speaker_embedding = nn.Embedding(self.cfg.speaker_dims, self.cfg.hidden_size)
+        token_length = self.cfg.pose_length // self.cfg.token_downsample_factor
+        self.position_embeddings = PeriodicPositionalEncoding(
+            self.cfg.hidden_size,
+            period=token_length,
+            max_seq_len=8192,
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=self.cfg.hidden_size,
+            nhead=4,
+            dim_feedforward=self.cfg.hidden_size * 2,
+        )
+        self.token_encoder = nn.TransformerEncoder(layer, num_layers=self.cfg.token_transformer_layers)
+        self.out_face = nn.Linear(self.cfg.hidden_size, self.cfg.vae_codebook_size)
+        self.out_upper = nn.Linear(self.cfg.hidden_size, self.cfg.vae_codebook_size)
+        self.out_hands = nn.Linear(self.cfg.hidden_size, self.cfg.vae_codebook_size)
+        self.out_lower = nn.Linear(self.cfg.hidden_size, self.cfg.vae_codebook_size)
+
+    def forward(self, audio, speaker_id):
+        audio_features = self.audio_encoder(audio)
+        token_features = self.token_downsample(audio_features.transpose(1, 2)).transpose(1, 2)
+        token_features = self.position_embeddings(token_features)
+        speaker_features = self.speaker_embedding(speaker_id).expand(-1, token_features.shape[1], -1)
+        token_length = token_features.shape[1]
+        causal_mask = torch.ones(token_length, token_length, dtype=torch.bool, device=audio.device).triu(1)
+        token_features = self.token_encoder(
+            (token_features + speaker_features).permute(1, 0, 2),
+            mask=causal_mask,
+        ).permute(1, 0, 2)
+        return {
+            "cls_face": self.out_face(token_features),
+            "cls_upper": self.out_upper(token_features),
+            "cls_hands": self.out_hands(token_features),
+            "cls_lower": self.out_lower(token_features),
+        }
+
+    def inference(self, audio, speaker_id):
+        return self(audio, speaker_id)
 
 
+class RotaryPositionEmbedding(nn.Module):
+    """RoPE applied to (bs, heads, T, head_dim) query/key tensors."""
+
+    def __init__(self, head_dim, base=10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x):
+        freqs = torch.outer(
+            torch.arange(x.shape[-2], device=x.device, dtype=self.inv_freq.dtype),
+            self.inv_freq,
+        )  # (T, head_dim/2)
+        cos = freqs.cos()[None, None]
+        sin = freqs.sin()[None, None]
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        out = torch.empty_like(x)
+        out[..., 0::2] = x1 * cos - x2 * sin
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out
 
 
+class SelfAttention(nn.Module):
+    """Multi-head self-attention with optional RoPE and optional causal mask."""
+
+    def __init__(self, dim, nhead, rope=None, causal=True):
+        super().__init__()
+        self.nhead = nhead
+        self.rope = rope
+        self.causal = causal
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        bs, t, dim = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(bs, t, self.nhead, -1).transpose(1, 2)
+        k = k.view(bs, t, self.nhead, -1).transpose(1, 2)
+        v = v.view(bs, t, self.nhead, -1).transpose(1, 2)
+        if self.rope is not None:
+            q, k = self.rope(q), self.rope(k)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+        return self.out(out.transpose(1, 2).reshape(bs, t, dim))
+
+
+class CausalAudioCrossAttention(nn.Module):
+    """Cross-attention from token positions to the 1:1-aligned causal audio tokens."""
+
+    def __init__(self, dim, nhead, rope):
+        super().__init__()
+        self.nhead = nhead
+        self.rope = rope
+        self.q_proj = nn.Linear(dim, dim)
+        self.kv_proj = nn.Linear(dim, dim * 2)
+        self.out = nn.Linear(dim, dim)
+
+    def forward(self, x, audio):
+        bs, t, dim = x.shape
+        s = audio.shape[1]
+        q = self.q_proj(x).view(bs, t, self.nhead, -1).transpose(1, 2)
+        k, v = self.kv_proj(audio).chunk(2, dim=-1)
+        k = k.view(bs, s, self.nhead, -1).transpose(1, 2)
+        v = v.view(bs, s, self.nhead, -1).transpose(1, 2)
+        q, k = self.rope(q), self.rope(k)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.out(out.transpose(1, 2).reshape(bs, t, dim))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class RegionBlock(nn.Module):
+    """One region-expert block: causal self-attn + causal audio cross-attn + FFN."""
+
+    def __init__(self, dim, nhead, rope):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = SelfAttention(dim, nhead, rope=rope, causal=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.audio_attn = CausalAudioCrossAttention(dim, nhead, rope)
+        self.norm3 = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, dim * 2)
+
+    def forward(self, x, audio):
+        x = x + self.self_attn(self.norm1(x))
+        x = x + self.audio_attn(self.norm2(x), audio)
+        return x + self.ffn(self.norm3(x))
+
+
+class FusionBlock(nn.Module):
+    """Coordinates the four region streams: same-time region attention, causal
+    temporal attention, audio cross-attention, FFN."""
+
+    def __init__(self, dim, nhead, rope):
+        super().__init__()
+        self.norm_region = nn.LayerNorm(dim)
+        self.region_attn = SelfAttention(dim, nhead, causal=False)
+        self.norm_time = nn.LayerNorm(dim)
+        self.time_attn = SelfAttention(dim, nhead, rope=rope, causal=True)
+        self.norm_audio = nn.LayerNorm(dim)
+        self.audio_attn = CausalAudioCrossAttention(dim, nhead, rope)
+        self.norm_ffn = nn.LayerNorm(dim)
+        self.ffn = FeedForward(dim, dim * 2)
+
+    def forward(self, h, audio):
+        # h: (bs, N, R, D), audio: (bs, N, D)
+        bs, n, r, d = h.shape
+        x = h.reshape(bs * n, r, d)
+        x = x + self.region_attn(self.norm_region(x))
+        x = x.reshape(bs, n, r, d).permute(0, 2, 1, 3).reshape(bs * r, n, d)
+        x = x + self.time_attn(self.norm_time(x))
+        audio_rep = audio.unsqueeze(1).expand(bs, r, n, d).reshape(bs * r, n, d)
+        x = x + self.audio_attn(self.norm_audio(x), audio_rep)
+        x = x + self.ffn(self.norm_ffn(x))
+        return x.reshape(bs, r, n, d).permute(0, 2, 1, 3)
+
+
+def shift_tokens_with_bos(targets, bos_id):
+    """Right-shift per-region target tokens and prepend BOS as history input."""
+    return {
+        part: torch.cat(
+            (torch.full_like(tokens[:, :1], bos_id), tokens[:, :-1]), dim=1
+        )
+        for part, tokens in targets.items()
+    }
+
+
+class CausalEmageAudioTokenModel(PreTrainedModel):
+    """LiveGesture-style audio-to-token predictor over the frozen sVQ-VAE codes.
+
+    Four lightweight region branches first model each part's token history
+    (all sharing one causal audio encoder), then a fusion module coordinates
+    the regions; four classification heads predict the next VQ token per part.
+    Predicted tokens feed back as history; decoded motion is only an output.
+    """
+
+    PARTS = ("face", "upper", "hands", "lower")
+
+    config_class = EmageAudioConfig
+    base_model_prefix = "causal_emage_audio_token"
+
+    def __init__(self, config: EmageAudioConfig):
+        super().__init__(config)
+        self.cfg = config
+        dim = self.cfg.hidden_size
+        nhead = getattr(self.cfg, "num_heads", 4)
+        if dim % nhead != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        if (dim // nhead) % 2 != 0:
+            raise ValueError("RoPE requires an even head dimension")
+        codebook = self.cfg.vae_codebook_size
+        self.bos_id = codebook  # embedding row used for the BOS token
+
+        self.audio_encoder = CausalMelAudioEncoder(
+            dim,
+            sr=self.cfg.audio_sr,
+            hidden_f=self.cfg.audio_f,
+            token_downsample_factor=self.cfg.token_downsample_factor,
+            pose_fps=self.cfg.pose_fps,
+        )
+        self.speaker_embedding = nn.Embedding(self.cfg.speaker_dims, dim)
+        # +1 row for the BOS token used to right-shift the teacher-forced history
+        self.token_embedding = nn.ModuleDict(
+            {part: nn.Embedding(codebook + 1, dim) for part in self.PARTS}
+        )
+        rope = RotaryPositionEmbedding(dim // nhead)
+        self.region_branches = nn.ModuleDict(
+            {
+                part: nn.ModuleList(
+                    RegionBlock(dim, nhead, rope)
+                    for _ in range(getattr(self.cfg, "region_transformer_layers", 2))
+                )
+                for part in self.PARTS
+            }
+        )
+        self.fusion = nn.ModuleList(
+            FusionBlock(dim, nhead, rope)
+            for _ in range(getattr(self.cfg, "fusion_layers", 2))
+        )
+        self.heads = nn.ModuleDict(
+            {part: nn.Linear(dim, codebook) for part in self.PARTS}
+        )
+
+    def forward(self, audio, speaker_id, past_tokens, audio_token_start=0):
+        token_length = past_tokens[self.PARTS[0]].shape[1]
+
+        # past_tokens 对应全局 token 区间 [start, end)
+        start = int(audio_token_start)
+        end = start + token_length
+        if start < 0:
+            raise ValueError("audio_token_start must be non-negative")
+
+        # 先从完整音频前缀提取特征，保留原有 STFT 时间网格和卷积上下文，
+        # 再选择与 token 历史对应的音频 token（与滑动的历史窗口对齐）。
+        audio_all = self.audio_encoder(audio, target_tokens=end)  # (bs, end, dim) at 7.5Hz
+        if audio_all.shape[1] < end:
+            raise RuntimeError(
+                f"Audio tokens insufficient: need {end}, got {audio_all.shape[1]}"
+            )
+        audio_feat = audio_all[:, start:end]
+
+        speaker = self.speaker_embedding(speaker_id).expand(-1, token_length, -1)
+        region_features = []
+        for part in self.PARTS:
+            x = self.token_embedding[part](past_tokens[part]) + speaker
+            for block in self.region_branches[part]:
+                x = block(x, audio_feat)
+            region_features.append(x)
+
+        h = torch.stack(region_features, dim=2)  # (bs, N, 4, dim)
+        for block in self.fusion:
+            h = block(h, audio_feat)
+
+        return {
+            f"cls_{part}": self.heads[part](h[:, :, region_id])
+            for region_id, part in enumerate(self.PARTS)
+        }
+
+    @torch.no_grad()
+    def inference(self, audio, speaker_id):
+        """One-token-per-step streaming generation over a token history.
+
+        The history starts from BOS only; each step predicts the next block's
+        four codes from the token history and the audio received so far, then
+        appends the codes to the history. Decoded motion never feeds back into
+        the predictor; the caller decodes the returned tokens via the frozen
+        sVQ-VAE for output.
+        """
+        block = self.cfg.token_downsample_factor
+        frames = audio.shape[1] * self.cfg.pose_fps // self.cfg.audio_sr
+        frames -= frames % block
+        total_blocks = frames // block
+        if total_blocks < 2:
+            raise ValueError("Audio must contain at least two motion blocks")
+
+        # `history_window_tokens` is the max number of input positions kept;
+        # the window is a plain contiguous crop, so the BOS leaves naturally
+        # once the window slides past it.
+        history_window = int(getattr(self.cfg, "history_window_tokens", 32))
+        if history_window < 1:
+            raise ValueError("history_window_tokens must be positive")
+
+        bs = audio.shape[0]
+        past_tokens = {
+            part: torch.full((bs, 1), self.bos_id, dtype=torch.long, device=audio.device)
+            for part in self.PARTS
+        }
+        logits = {f"cls_{part}": [] for part in self.PARTS}
+        # Step i forecasts B_{i+1} (i = 0..total_blocks-2).  Audio evidence covers
+        # up to (i+1)*block/30 s = the end of block i, i.e. "predict B_{i+1} sees
+        # 0..(i+1)*block/30".  This is the exact train-time logit j -> target B_{j+1}
+        # alignment from the shifted-future split (0ms lookahead).
+        for i in range(total_blocks - 1):
+            # 历史窗口滑动后，用全局音频 token 起点对齐，避免"音频还停在开头"的错位。
+            history_tokens = past_tokens[self.PARTS[0]].shape[1]
+            audio_token_end = i + 1
+            audio_token_start = audio_token_end - history_tokens
+
+            audio_end = round(
+                audio_token_end * block
+                * self.cfg.audio_sr / self.cfg.pose_fps
+            )
+
+            chunk_logits = self(
+                audio[:, :audio_end],
+                speaker_id,
+                past_tokens,
+                audio_token_start=audio_token_start,
+            )
+            for part in self.PARTS:
+                name = f"cls_{part}"
+                next_logit = chunk_logits[name][:, -1:]
+                logits[name].append(next_logit)
+                past_tokens[part] = torch.cat(
+                    (past_tokens[part], next_logit.argmax(dim=-1)), dim=1
+                )[:, -history_window:]
+
+        return {name: torch.cat(values, dim=1) for name, values in logits.items()}
 
 
 

@@ -1,5 +1,10 @@
 *.pyc
-./BEAT2/
-./examples/motion/
-./emage_evaltools/
-./datasets/data_json/*
+BEAT2/
+outputs/
+datasets/data_json/*
+
+# emage_evaltools: 排除 Git LFS 追踪的大体积二进制/数据文件，仅保留源码
+emage_evaltools/smplx_models/
+emage_evaltools/*.bin
+emage_evaltools/*.npy
+emage_evaltools/.cache/

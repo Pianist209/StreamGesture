@@ -1,0 +1,14 @@
+/home/limenghuan/miniconda3/envs/pantomatrix/lib/python3.9/site-packages/wandb/sdk/launch/builder/build.py:11: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+Traceback (most recent call last):
+  File "/cto_studio/vistring/limenghuan/PantoMatrix/train_emage_audio.py", line 550, in <module>
+    main(config)
+  File "/cto_studio/vistring/limenghuan/PantoMatrix/train_emage_audio.py", line 156, in main
+    torch.distributed.init_process_group(backend="nccl")
+  File "/home/limenghuan/miniconda3/envs/pantomatrix/lib/python3.9/site-packages/torch/distributed/distributed_c10d.py", line 888, in init_process_group
+    store, rank, world_size = next(rendezvous_iterator)
+  File "/home/limenghuan/miniconda3/envs/pantomatrix/lib/python3.9/site-packages/torch/distributed/rendezvous.py", line 235, in _env_rendezvous_handler
+    rank = int(_get_env_or_raise("RANK"))
+  File "/home/limenghuan/miniconda3/envs/pantomatrix/lib/python3.9/site-packages/torch/distributed/rendezvous.py", line 220, in _get_env_or_raise
+    raise _env_error(env_var)
+ValueError: Error initializing torch.distributed using env:// rendezvous: environment variable RANK expected, but not set

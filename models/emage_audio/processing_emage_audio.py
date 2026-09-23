@@ -313,6 +313,179 @@ class WavEncoder(nn.Module):
         out = self.feat_extractor(wav_data)
         return out.transpose(1, 2)
 
+
+class CausalBasicBlock(nn.Module):
+    """Residual temporal block whose output at t only uses samples up to t."""
+
+    def __init__(self, inplanes, planes, kernel_size, stride=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv1 = nn.Conv1d(inplanes, planes, kernel_size, stride=stride)
+        self.conv2 = nn.Conv1d(planes, planes, kernel_size)
+        self.norm1 = nn.LayerNorm(planes)
+        self.norm2 = nn.LayerNorm(planes)
+        self.act = nn.LeakyReLU(inplace=True)
+        self.downsample = nn.Conv1d(inplanes, planes, kernel_size=1, stride=stride) if stride != 1 or inplanes != planes else None
+
+    @staticmethod
+    def _normalize(x, norm):
+        return norm(x.transpose(1, 2)).transpose(1, 2)
+
+    def forward(self, x):
+        shortcut = x if self.downsample is None else self.downsample(x)
+        x = self.conv1(F.pad(x, (self.kernel_size - 1, 0)))
+        x = self.act(self._normalize(x, self.norm1))
+        x = self.conv2(F.pad(x, (self.kernel_size - 1, 0)))
+        x = self._normalize(x, self.norm2)
+        return self.act(x + shortcut)
+
+
+class CausalWavEncoder(nn.Module):
+    """30 FPS waveform encoder with no future-audio dependency."""
+
+    def __init__(self, out_dim, audio_in=1):
+        super().__init__()
+        self.feat_extractor = nn.Sequential(
+            CausalBasicBlock(audio_in, out_dim // 4, 15, 5),
+            CausalBasicBlock(out_dim // 4, out_dim // 4, 15, 6),
+            CausalBasicBlock(out_dim // 4, out_dim // 4, 15, 1),
+            CausalBasicBlock(out_dim // 4, out_dim // 2, 15, 6),
+            CausalBasicBlock(out_dim // 2, out_dim // 2, 15, 1),
+            CausalBasicBlock(out_dim // 2, out_dim, 15, 3),
+        )
+
+    def forward(self, wav_data):
+        if wav_data.dim() == 2:
+            wav_data = wav_data.unsqueeze(1)
+        else:
+            wav_data = wav_data.transpose(1, 2)
+        return self.feat_extractor(wav_data).transpose(1, 2)
+
+def _hann_window(n_fft):
+    return 0.5 - 0.5 * torch.cos(2 * math.pi * torch.arange(n_fft).float() / (n_fft - 1))
+
+
+def _mel_filters(sr, n_fft, n_mels, fmin=0.0, fmax=None):
+    """Slaney-free triangular mel filterbank in pure torch (matches librosa)."""
+    fmax = fmax if fmax is not None else sr / 2.0
+    n_freqs = n_fft // 2 + 1
+    freqs = torch.linspace(0.0, float(sr / 2.0), n_freqs)
+
+    def hz_to_mel(f):
+        return 2595.0 * torch.log10(f + 700.0) - 2595.0 * math.log10(700.0)
+
+    def mel_to_hz(m):
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    mel_min, mel_max = hz_to_mel(torch.as_tensor(fmin, dtype=torch.float64)), hz_to_mel(torch.as_tensor(fmax, dtype=torch.float64))
+    mels = torch.linspace(mel_min.item(), mel_max.item(), n_mels + 2)
+    mel_freqs = mel_to_hz(mels)
+    filters = torch.zeros(n_mels, n_freqs)
+    for i in range(n_mels):
+        f_lo, f_c, f_hi = mel_freqs[i], mel_freqs[i + 1], mel_freqs[i + 2]
+        idx = (freqs >= f_lo) & (freqs < f_c)
+        filters[i, idx] = (freqs[idx] - f_lo) / (f_c - f_lo if f_c != f_lo else 1.0)
+        idx = (freqs >= f_c) & (freqs <= f_hi)
+        filters[i, idx] = (f_hi - freqs[idx]) / (f_hi - f_c if f_hi != f_c else 1.0)
+    return filters
+
+
+class CausalLogMel(nn.Module):
+    """Causal log-mel spectrogram.
+
+    Uses `center=False` STFT with NO padding: STFT frame k covers samples
+    [k*hop, k*hop+n_fft), so it only depends on audio already received.
+    """
+
+    def __init__(self, sr=16000, n_fft=400, hop_length=160, n_mels=80, eps=1e-6):
+        super().__init__()
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.eps = eps
+        self.register_buffer("window", _hann_window(n_fft).float())
+        self.register_buffer("mel_basis", _mel_filters(sr, n_fft, n_mels).float())
+
+    def forward(self, wav):
+        # wav: (bs, T) mono
+        spec = torch.stft(
+            wav,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            center=False,
+            pad_mode="constant",
+            return_complex=True,
+        )
+        power = spec.abs() ** 2
+        mel = torch.matmul(self.mel_basis, power)  # (bs, n_mels, T)
+        return torch.log(mel.clamp_min(self.eps) + 1.0)
+
+
+class CausalMelAudioEncoder(nn.Module):
+    """causal log-mel -> causal conv pyramid -> timestamp-aware 7.5Hz aligner.
+
+    Motion token rate: one audio token per `token_downsample_factor` motion
+    frames (7.5Hz at 30fps / 4x). Each audio token i pools only the mel frames
+    whose *window end* is <= the physical end time of motion block i
+    (4*(i+1)/30 s). This gives strict 0ms lookahead and never drifts because
+    membership is decided on exact sample timestamps, not integer frame counts.
+    """
+
+    def __init__(self, out_dim, sr=16000, n_mels=80, n_fft=400, hop_length=160,
+                 hidden_f=256, token_downsample_factor=4, pose_fps=30, n_pyramid=3):
+        super().__init__()
+        self.sr = sr
+        self.hop_length = hop_length
+        self.n_fft = n_fft
+        self.token_downsample_factor = token_downsample_factor
+        self.pose_fps = pose_fps
+        self.hidden_f = hidden_f
+        self.mel = CausalLogMel(sr, n_fft, hop_length, n_mels)
+        self.proj = nn.Conv1d(n_mels, hidden_f, kernel_size=3, padding=0)
+        self.pyramid = nn.Sequential(
+            *[CausalBasicBlock(hidden_f, hidden_f, 5, 1) for _ in range(n_pyramid)]
+        )
+        self.post = nn.Linear(hidden_f, out_dim)
+
+    def forward(self, wav, target_tokens=None):
+        # wav: (bs, T_audio) or (bs, 1, T_audio)
+        if wav.dim() == 3:
+            wav = wav[:, 0] if wav.shape[1] == 1 else wav.mean(dim=1)
+        logmel = self.mel(wav)                          # (bs, n_mels, T)
+        h = self.proj(F.pad(logmel, (2, 0)))            # causal pad kernel-1=2
+        h = self.pyramid(h)                             # (bs, hidden_f, T)
+        bs_, _, T = h.shape
+        if T == 0:
+            return torch.empty(bs_, 0, self.post.out_features, device=h.device)
+
+        # exact integer timestamp of each mel frame's window end (in samples)
+        frame_ends = (torch.arange(1, T + 1, device=h.device) * self.hop_length
+                      + self.n_fft)                                    # (T,)
+        # block end boundary for block i is 4*(i+1)/30 s; membership is
+        # decided by strict <= via exact integer arithmetic (no float drift).
+        block_denom = 4 * self.sr
+        block_idx = ((frame_ends * self.pose_fps + block_denom - 1) // block_denom - 1).long()  # (T,)
+        # The number of audio tokens is driven by the motion side (target_tokens),
+        # not by how much audio was passed: keep only mel frames that fall inside
+        # a valid token slot and drop any that would create an extra trailing token.
+        if target_tokens is not None and target_tokens <= block_idx.max().item():
+            N = int(target_tokens)
+        else:
+            N = int(block_idx.max().item()) + 1
+        valid = (block_idx >= 0) & (block_idx < N)
+        block_idx = block_idx[valid]
+        h_t = h.transpose(1, 2)[:, valid]               # (bs, T_valid, hidden_f)
+        T_valid = int(valid.sum().item())
+        summed = h_t.new_zeros(bs_, N, self.hidden_f).scatter_add_(
+            1, block_idx.view(1, T_valid, 1).expand(bs_, T_valid, self.hidden_f), h_t)
+        counts = h_t.new_zeros(N).scatter_add(0, block_idx, h_t.new_ones(T_valid)).clamp_min(1)  # (N,)
+        pooled = summed / counts.view(1, N, 1)          # (bs, N, hidden_f)
+        return self.post(pooled)                        # (bs, N, out_dim)
+
+
 class MLP(nn.Module):
     def __init__(self, in_dim, middle_dim, out_dim):
         super().__init__()
