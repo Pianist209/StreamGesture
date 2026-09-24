@@ -1,76 +1,66 @@
-# 完整前缀自回归与流式输出
+# 32-token 自回归窗口与流式输出
 
-本实现按参考图的约定，每一步根据全部过去 token 和已收到的音频，
-预测一个时间位置的 face / upper / hands / lower 四个 token；四个 token
-一起送入冻结的 sVQ decoder，输出 4 帧动作。没有随机 start 裁剪，也没有
-32-token 滑动截断。
+本实现按 LiveGesture 风格的 xAR 方式工作：每一步只预测一个 motion token。一个 token 对应 `token_downsample_factor` 帧动作，默认 4 帧。预测出的 face / upper / hands / lower 四个 token 一起送入冻结的 sVQ decoder，得到下一段动作。
 
-## 训练与时间轴
+模型现在使用固定的 motion 历史窗口。默认 `history_window_tokens: 32`，所以稳定阶段的语义是：
 
-- 30 FPS、4 帧一个 block。64 帧训练片段包含 B0…B15。
-- 保留原来的预测目标：将 B1…B15 编码为 q1…q15，输入是
-  `[BOS, q1, …, q14]`。完整序列的 15 个位置通过因果 mask 并行计算 CE。
-- 推理从 BOS 开始，每步只产生一个新时间位置，并反馈自己的预测。
-  teacher forcing 的并行训练不等于推理一次生成 15 个 token。
-- 收到 B0 的音频后预测 B1。因此第一次输出从原音频第 4 帧开始，
-  即 4/30 秒；这仍然是预测未来动作块的任务，不是同块音频重建。
-- NPZ 的 `start_time_seconds` 记录原始时间轴偏移。渲染裁掉相同长度的
-  音频，并将 GT / 额外参考动作裁到对应区间。
-- 离线文件输出 B1…B(N-1)，不补造 B0，不输出文件末尾之后的预测；
-  在线 `stream_step` 每收到完整音频块都会预测下一块。
+```text
+q_t = f(q_{t-32:t-1}, audio_window, speaker)
+q_t -> 4 frames motion
+```
 
-## 在线调用
+序列开头历史不足 32 个 token 时使用 BOS 和已有历史；达到 32 个 token 后不再访问更早的 motion token。训练和流式推理都走同一套窗口语义。
+
+## 训练时间轴
+
+配置里的训练片段改为 256 帧：
+
+```yaml
+data:
+  train_bs: 2
+  rewindow_stride: 20
+
+model:
+  pose_length: 256
+  token_downsample_factor: 4
+  history_window_tokens: 32
+```
+
+原始 manifest 仍然是 `beat2_s20_l64_speaker2.json`。`BEAT2DatasetEamge` 会把同一视频、同一 split、同一音频/动作文件中连续覆盖的 64 帧条目合并，再按 256 帧窗口重组样本。它不会跨视频、跨 split、跨文件或跨中间缺口拼接。
+
+256 帧片段包含 B0…B63。训练目标是 B1…B63，所以每个样本有 63 个 token 目标。输入 token 是右移后的 teacher-forcing 历史：
+
+```text
+target: q1, q2, ..., q63
+input : BOS, q1, ..., q62
+```
+
+`forward()` 会先用整段音频算出 causal audio tokens，再为每个目标位置取同样长度的局部窗口。位置 32 之后，每个预测只看最近 32 个输入 token 和对齐的最近 32 个 audio token。没有随机 start 裁剪，也不是一次性生成 63 个 token；只是把 63 个 teacher-forcing 位置并行算 loss。
+
+## 推理时间轴
+
+在线推理从 BOS 开始，每收到一个完整音频 block，就预测下一个 motion token：
 
 ```python
 model.eval()
 motion_vq.eval()
 state = None
-for audio_chunk in audio_source:  # (batch, samples)，与模型相同设备和采样率
+for audio_chunk in audio_source:  # (batch, samples)
     ready, state = model.stream_step(
         audio_chunk, speaker_id, state=state, motion_vq=motion_vq,
     )
     for block in ready:
-        # block['indices']: 每个部位 (batch, 1)
-        # block['motion']: 4 帧 motion_axis_angle / expression / trans 等
-        # block['start_frame'], block['end_frame']: 原始音频时间轴
-        consume(block['motion'], block['start_frame'])
+        consume(block["motion"], block["start_frame"])
 ```
 
-`consume` 和 `audio_source` 是调用方接口。一个分块可以产生零个、一个或多个
-输出块；不足一个时间区间的音频保留在 state 中，不用未来数据补齐。
-每次新会话将 state 重置为 None；同一会话保持 batch、speaker 和 decoder 不变。
+`state["tokens"]` 和 `state["audio_features"]` 都最多保留 32 个位置。上一版完整前缀 KV cache 已移除，所以 transformer 推理不会无限增长 motion-token attention state。
 
-音频状态保留 STFT 的未处理样本、有限 mel 卷积上下文和未完成的池化区间。
-注意力使用带全局位置偏移的 RoPE 和每层 KV cache。VQ decoder 的状态跨步保存。
-完整历史的 KV 内存随时长增长，注意力仍需访问历史；这里不声称恒定内存或已达到
-实测实时性能。
+音频 encoder 仍然保留自己的流式状态，包括 STFT 未完成样本、mel 卷积上下文和未完成池化区间。这是为了保证流式音频特征和离线 causal 音频特征一致；它不是 motion token 历史，也不会改变“只看最近 32 个 motion token”的语义。
 
-`inference_stream(audio, speaker_id, motion_vq)` 可逐块迭代已有录音。
-`generate_motion(...)` 收集同一条流式路径的动作输出，供保存文件和评估使用。
-`inference(...)` 保留收集 token logits 的接口。
+`inference_stream(audio, speaker_id, motion_vq)` 是离线录音的流式适配器。`generate_motion(...)` 收集同一条流式路径的动作输出，用于保存文件和评估。第一次输出仍然从原音频第 4 帧开始，即收到 B0 音频后预测 B1。
 
-## 修复与评估
+## 评估
 
-- 音频切片先按绝对帧时间换算起点，再取整；固定片段长度向上取整，避免
-  16000//30 累积漂移，并保持同长样本可堆叠成 batch。
-- STFT 第 k 帧的结束位置为 `k * hop + n_fft`，k 从 0 开始。
-  池化的分母使用配置的 token_downsample_factor，而不是写死 4。
-- validation CE 仍是 teacher forcing；用于选模的 validation FGD 改为
-  从 BOS 自由生成并流式解码后的动作。配置开启整段录音的测试指标，
-  可用 `validation.evaluation=False` 关闭耗时的整段评估。
+validation CE 仍然是 teacher forcing，但每个位置用固定 32-token 窗口计算。validation FGD 使用从 BOS 自由生成的 token，并通过同一条 `stream_step` / `decode_stream` 路径解码动作。
 
-训练命令保持不变，例如：
-
-```bash
-torchrun --standalone --nproc_per_node=1 train_emage_audio.py --config configs/emage_streamable_audio.yaml
-python -m unittest discover -s tests -v
-```
-
-测试覆盖分块不变性、缓存/完整前缀等价性、未来信息隔离、逐步 decoder 状态、
-完整训练序列反向传播、长录音的音频切片对齐。decoder 测试使用替身，只验证调用
-协议；真实 sVQ 仍依赖配置指定的外部 PantoMatrix-legacy 源码和权重。
-
-音频对齐与输入分布已修正，建议重新训练；旧权重的参数形状兼容并不意味着效果
-保持不变。64 帧数据仍只监督最多 15 个历史位置，长历史生成质量需要长录音评估，
-必要时使用更长训练片段，而不是恢复随机裁剪。尚未用真实数据、GPU 或 sVQ 权重
-验证动作质量和延迟。
+拉取这次改动后需要重新训练 predictor；上一版完整前缀 KV cache 语义下训练出的权重不再对应当前推理范式。

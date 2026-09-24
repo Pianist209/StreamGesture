@@ -30,6 +30,7 @@ class StreamingTests(unittest.TestCase):
             hidden_size=16, num_heads=2, audio_f=8, audio_sr=16000,
             token_downsample_factor=4, pose_fps=30, speaker_dims=1,
             vae_codebook_size=16, region_transformer_layers=2, fusion_layers=2,
+            history_window_tokens=32,
         )).eval()
         self.speaker = torch.zeros(2, 1, dtype=torch.long)
 
@@ -53,25 +54,43 @@ class StreamingTests(unittest.TestCase):
                 torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
 
     @torch.no_grad()
-    def test_kv_cache_matches_parallel_teacher_forcing_beyond_32(self):
+    def test_training_forward_matches_explicit_32_token_windows(self):
+        n = 40
+        audio = torch.randn(2, (n * 4 * 16000 + 29) // 30)
+        targets = {part: torch.randint(0, 16, (2, n)) for part in self.model.PARTS}
+        inputs = shift_tokens_with_bos(targets, self.model.bos_id)
+        batched = self.model(audio, self.speaker, inputs)
+        audio_features = self.model.audio_encoder(audio, target_tokens=n)
+
+        explicit = {f"cls_{part}": [] for part in self.model.PARTS}
+        for j in range(n):
+            start = max(0, j - self.model.history_window_tokens + 1)
+            logits = self.model._predict_window(
+                audio_features[:, start:j + 1], self.speaker,
+                {part: tokens[:, start:j + 1] for part, tokens in inputs.items()},
+            )
+            for part in self.model.PARTS:
+                explicit[f"cls_{part}"].append(logits[f"cls_{part}"][:, -1:])
+        for key in batched:
+            expected = torch.cat(explicit[key], dim=1)
+            torch.testing.assert_close(batched[key], expected, atol=3e-6, rtol=3e-5)
+
+    @torch.no_grad()
+    def test_tokens_before_32_window_do_not_change_later_prediction(self):
         n = 40
         audio = torch.randn(2, (n * 4 * 16000 + 29) // 30)
         targets = {part: torch.randint(0, 16, (2, n)) for part in self.model.PARTS}
         inputs = shift_tokens_with_bos(targets, self.model.bos_id)
         expected = self.model(audio, self.speaker, inputs)
-        audio_features = self.model.audio_encoder(audio, target_tokens=n)
-        cache = None
-        outputs = []
-        for i in range(n):
-            logits, cache = self.model._token_step(
-                audio_features[:, i:i+1], self.speaker,
-                {part: tokens[:, i:i+1] for part, tokens in inputs.items()}, cache,
-            )
-            outputs.append(logits)
+
+        changed_inputs = {part: tokens.clone() for part, tokens in inputs.items()}
+        last_start = n - self.model.history_window_tokens
+        for part in self.model.PARTS:
+            changed_inputs[part][:, :last_start] = (changed_inputs[part][:, :last_start] + 7) % 16
+        actual = self.model(audio, self.speaker, changed_inputs)
+
         for key in expected:
-            actual = torch.cat([out[key] for out in outputs], dim=1)
-            torch.testing.assert_close(actual, expected[key], atol=3e-6, rtol=3e-5)
-        self.assertEqual(cache["regions"]["face"][0][0][0].shape[-2], n)
+            torch.testing.assert_close(actual[key][:, -1:], expected[key][:, -1:], atol=3e-6, rtol=3e-5)
 
     @torch.no_grad()
     def test_future_audio_and_tokens_do_not_change_prefix(self):
@@ -89,41 +108,52 @@ class StreamingTests(unittest.TestCase):
             torch.testing.assert_close(actual[key][:, :3], expected[key][:, :3])
 
     @torch.no_grad()
-    def test_free_running_matches_full_prefix_and_decodes_each_step(self):
-        audio = torch.randn(2, 17067)
+    def test_free_running_matches_strict_window_and_decodes_each_step(self):
+        n = 40
+        audio = torch.randn(2, (n * 4 * 16000 + 29) // 30)
         decoder = CountingDecoder()
-        outputs = list(self.model.inference_stream(audio, self.speaker, decoder))
-        self.assertEqual(len(outputs), 7)
+        outputs = list(self.model.inference_stream(audio, self.speaker, decoder, num_tokens=n))
+        self.assertEqual(len(outputs), n)
+
+        audio_features = self.model.audio_encoder(audio, target_tokens=n)
         history = {part: torch.full((2, 1), self.model.bos_id) for part in self.model.PARTS}
         for i, out in enumerate(outputs):
-            end = ((i + 1) * 4 * 16000 + 29) // 30
-            expected = self.model(audio[:, :end], self.speaker, history)
+            window_len = min(self.model.history_window_tokens, i + 1)
+            start = i + 1 - window_len
+            logits = self.model._predict_window(
+                audio_features[:, start:i + 1], self.speaker,
+                {part: tokens[:, -window_len:] for part, tokens in history.items()},
+            )
             for part in self.model.PARTS:
                 key = f"cls_{part}"
-                torch.testing.assert_close(out["logits"][key], expected[key][:, -1:], atol=3e-6, rtol=3e-5)
+                torch.testing.assert_close(out["logits"][key], logits[key][:, -1:], atol=3e-6, rtol=3e-5)
                 history[part] = torch.cat((history[part], out["indices"][part]), dim=1)
             self.assertEqual(out["start_frame"], (i + 1) * 4)
             self.assertEqual(out["motion"]["motion"].shape[1], 4)
             self.assertTrue((out["motion"]["decoder_step"] == i).all())
-        collected = self.model.generate_motion(audio, self.speaker, decoder)
-        self.assertEqual(collected["motion"].shape[1], 28)
-        # Arbitrary live chunks produce the same first seven forecasts. Feeding
-        # the eighth block also forecasts B8, which the file adapter excludes.
+
+        collected = self.model.generate_motion(audio, self.speaker, CountingDecoder(), num_tokens=n)
+        self.assertEqual(collected["motion"].shape[1], n * 4)
+
         state, live = None, []
         for start in range(0, audio.shape[1], 997):
-            result, state = self.model.stream_step(audio[:, start:start+997], self.speaker, state, decoder)
+            result, state = self.model.stream_step(audio[:, start:start + 997], self.speaker, state, decoder)
             live.extend(result)
-        self.assertEqual(len(live), 8)
+        self.assertEqual(len(live), n)
         for expected, actual in zip(outputs, live):
             for part in self.model.PARTS:
                 torch.testing.assert_close(actual["logits"][f"cls_{part}"], expected["logits"][f"cls_{part}"], atol=3e-6, rtol=3e-5)
-        self.assertEqual(state["decoder"], 8)
+        self.assertLessEqual(state["tokens"]["face"].shape[1], 32)
+        self.assertLessEqual(state["audio_features"].shape[1], 32)
+        self.assertNotIn("attention", state)
+        self.assertEqual(state["decoder"], n)
 
     def test_complete_sequence_has_gradients(self):
         self.model.train()
-        targets = {part: torch.randint(0, 16, (2, 15)) for part in self.model.PARTS}
+        n = 63
+        targets = {part: torch.randint(0, 16, (2, n)) for part in self.model.PARTS}
         inputs = shift_tokens_with_bos(targets, self.model.bos_id)
-        outputs = self.model(torch.randn(2, 34134), self.speaker, inputs)
+        outputs = self.model(torch.randn(2, 136534), self.speaker, inputs)
         loss = sum(torch.nn.functional.cross_entropy(outputs[f"cls_{part}"].transpose(1, 2), targets[part])
                    for part in self.model.PARTS)
         loss.backward()

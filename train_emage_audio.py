@@ -106,9 +106,9 @@ def train_val_fn(cfg, batch, model, device, mode="train", **kwargs):
     motion_gt = rc.axis_angle_to_rotation_6d(motion_gt.reshape(bs,t,j,3)).reshape(bs, t, j*6)
    
     # Stage-2: predict the shifted future sequence, conditioned on past tokens.
-    # target = the 4-frame-shifted future (B1..B15) encoded as one VQ stream;
-    # the model input is the right-shifted target tokens with a BOS prepended
-    # (teacher forcing).
+    # A 256-frame clip gives 63 targets (B1..B63) when factor=4. The model
+    # internally uses the same bounded previous-token window during training
+    # that stream_step uses during inference.
     factor = cfg.model.token_downsample_factor
     future_motion = motion_gt[:, factor:]
     future_expr = expressions_gt[:, factor:]
@@ -117,8 +117,8 @@ def train_val_fn(cfg, batch, model, device, mode="train", **kwargs):
     latent_index_dict = motion_vq.map2index(future_motion, future_expr)
     full_inputs = shift_tokens_with_bos(latent_index_dict, cfg.model.vae_codebook_size)
 
-    # Full BOS-prefixed teacher forcing. Causal masks give every target its
-    # correct prefix while computing all 15 training positions in parallel.
+    # Teacher forcing over all target positions. Each position is computed from
+    # at most cfg.model.history_window_tokens previous motion tokens.
     motion_pred = model(audio, speaker_id, full_inputs)
     loss_dict = {
         "cls": get_cls_loss(motion_pred, latent_index_dict, cfg.model.cu, cfg.model.cl, cfg.model.ch, cfg.model.cf, kwargs["ClsFn"]),

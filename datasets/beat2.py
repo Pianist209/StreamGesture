@@ -10,6 +10,59 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from emage_utils.motion_io import beat_format_load, MASK_DICT
 
+
+def _cfg_get(obj, key, default=None):
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def rewindow_motion_metadata(items, clip_length, stride):
+    """Build fixed-length windows inside continuous manifest coverage.
+
+    The shipped BEAT2 manifest is made from overlapping 64-frame clips. For
+    AR training with a 32-token history we need longer examples, so this
+    merges only overlapping/touching ranges from the same source file and
+    re-emits deterministic windows. It never crosses split, video, audio or
+    motion-file boundaries, and it does not invent frames outside the original
+    covered ranges.
+    """
+    if clip_length <= 0 or stride <= 0:
+        raise ValueError("clip_length and stride must be positive")
+
+    groups = {}
+    for item in items:
+        key = (
+            item.get("mode"),
+            item.get("video_id"),
+            item["motion_path"],
+            item["audio_path"],
+        )
+        groups.setdefault(key, []).append(item)
+
+    windows = []
+    for key in sorted(groups):
+        group = sorted(groups[key], key=lambda x: (x["start_idx"], x["end_idx"]))
+        spans = []
+        for item in group:
+            start, end = int(item["start_idx"]), int(item["end_idx"])
+            if not spans or start > spans[-1][1]:
+                spans.append([start, end, item])
+            else:
+                spans[-1][1] = max(spans[-1][1], end)
+
+        for start, end, template in spans:
+            last_start = end - clip_length
+            current = start
+            while current <= last_start:
+                new_item = dict(template)
+                new_item["start_idx"] = current
+                new_item["end_idx"] = current + clip_length
+                new_item["video_id"] = f"{template.get('video_id', 'clip')}_{current}_{current + clip_length}"
+                windows.append(new_item)
+                current += stride
+    return windows
+
 class BEAT2Dataset(data.Dataset):
     def __init__(self, cfg, split):
         vid_meta = []
@@ -60,6 +113,17 @@ class BEAT2Dataset(data.Dataset):
 class BEAT2DatasetEamge(BEAT2Dataset):
     def __init__(self, cfg, split):
         super().__init__(cfg, split)
+        rewindow_stride = _cfg_get(cfg.data, "rewindow_stride", None)
+        if rewindow_stride is not None:
+            smplx_fps = 30
+            raw_clip_length = int(_cfg_get(
+                cfg.data, "rewindow_length",
+                cfg.model.pose_length * (smplx_fps // cfg.model.pose_fps),
+            ))
+            self.vid_meta = rewindow_motion_metadata(
+                self.vid_meta, raw_clip_length, int(rewindow_stride)
+            )
+            self.data_list = self.vid_meta
 
     def __getitem__(self, item):
         data_item = self.data_list[item]

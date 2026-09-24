@@ -558,9 +558,9 @@ class RotaryPositionEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, x, offset=0):
+    def forward(self, x):
         freqs = torch.outer(
-            torch.arange(offset, offset + x.shape[-2], device=x.device, dtype=self.inv_freq.dtype),
+            torch.arange(x.shape[-2], device=x.device, dtype=self.inv_freq.dtype),
             self.inv_freq,
         )  # (T, head_dim/2)
         cos = freqs.cos()[None, None]
@@ -594,21 +594,6 @@ class SelfAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         return self.out(out.transpose(1, 2).reshape(bs, t, dim))
 
-    def forward_step(self, x, cache=None):
-        """One new position attends to all cached positions and itself."""
-        bs, _, dim = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q, k, v = [a.view(bs, 1, self.nhead, -1).transpose(1, 2) for a in (q, k, v)]
-        offset = 0 if cache is None else cache[0].shape[-2]
-        if self.rope is not None:
-            q, k = self.rope(q, offset), self.rope(k, offset)
-        if cache is not None:
-            k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
-        # No future keys exist. is_causal=True with a single query would apply
-        # an upper-left mask and incorrectly hide most of the cached prefix.
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        return self.out(out.transpose(1, 2).reshape(bs, 1, dim)), (k, v)
-
 
 class CausalAudioCrossAttention(nn.Module):
     """Cross-attention from token positions to the 1:1-aligned causal audio tokens."""
@@ -631,18 +616,6 @@ class CausalAudioCrossAttention(nn.Module):
         q, k = self.rope(q), self.rope(k)
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.out(out.transpose(1, 2).reshape(bs, t, dim))
-
-    def forward_step(self, x, audio, cache=None):
-        bs, _, dim = x.shape
-        q = self.q_proj(x).view(bs, 1, self.nhead, -1).transpose(1, 2)
-        k, v = self.kv_proj(audio).chunk(2, dim=-1)
-        k, v = [a.view(bs, 1, self.nhead, -1).transpose(1, 2) for a in (k, v)]
-        offset = 0 if cache is None else cache[0].shape[-2]
-        q, k = self.rope(q, offset), self.rope(k, offset)
-        if cache is not None:
-            k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        return self.out(out.transpose(1, 2).reshape(bs, 1, dim)), (k, v)
 
 
 class FeedForward(nn.Module):
@@ -670,14 +643,6 @@ class RegionBlock(nn.Module):
         x = x + self.self_attn(self.norm1(x))
         x = x + self.audio_attn(self.norm2(x), audio)
         return x + self.ffn(self.norm3(x))
-
-    def forward_step(self, x, audio, cache=None):
-        self_cache, audio_cache = (None, None) if cache is None else cache
-        y, self_cache = self.self_attn.forward_step(self.norm1(x), self_cache)
-        x = x + y
-        y, audio_cache = self.audio_attn.forward_step(self.norm2(x), audio, audio_cache)
-        x = x + y
-        return x + self.ffn(self.norm3(x)), (self_cache, audio_cache)
 
 
 class FusionBlock(nn.Module):
@@ -707,20 +672,6 @@ class FusionBlock(nn.Module):
         x = x + self.ffn(self.norm_ffn(x))
         return x.reshape(bs, r, n, d).permute(0, 2, 1, 3)
 
-    def forward_step(self, h, audio, cache=None):
-        bs, _, r, d = h.shape
-        time_cache, audio_cache = (None, None) if cache is None else cache
-        x = h[:, 0]
-        x = x + self.region_attn(self.norm_region(x))
-        x = x.reshape(bs * r, 1, d)
-        y, time_cache = self.time_attn.forward_step(self.norm_time(x), time_cache)
-        x = x + y
-        audio_rep = audio.unsqueeze(1).expand(bs, r, 1, d).reshape(bs * r, 1, d)
-        y, audio_cache = self.audio_attn.forward_step(self.norm_audio(x), audio_rep, audio_cache)
-        x = x + y
-        x = x + self.ffn(self.norm_ffn(x))
-        return x.reshape(bs, 1, r, d), (time_cache, audio_cache)
-
 
 def shift_tokens_with_bos(targets, bos_id):
     """Right-shift per-region target tokens and prepend BOS as history input."""
@@ -738,7 +689,7 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
     Four lightweight region branches first model each part's token history
     (all sharing one causal audio encoder), then a fusion module coordinates
     the regions; four classification heads predict the next VQ token per part.
-    Predicted tokens feed back as history; decoded motion is only an output.
+    Training and streaming inference both use the same bounded history window.
     """
 
     PARTS = ("face", "upper", "hands", "lower")
@@ -757,6 +708,9 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             raise ValueError("RoPE requires an even head dimension")
         codebook = self.cfg.vae_codebook_size
         self.bos_id = codebook  # embedding row used for the BOS token
+        self.history_window_tokens = int(getattr(self.cfg, "history_window_tokens", 32))
+        if self.history_window_tokens < 1:
+            raise ValueError("history_window_tokens must be positive")
 
         self.audio_encoder = CausalMelAudioEncoder(
             dim,
@@ -788,12 +742,14 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             {part: nn.Linear(dim, codebook) for part in self.PARTS}
         )
 
-    def forward(self, audio, speaker_id, past_tokens):
-        """Parallel teacher forcing over the complete BOS-prefixed sequence."""
+    def _predict_window(self, audio_feat, speaker_id, past_tokens):
+        """Run the transformer on one already-aligned token/audio window."""
         token_length = past_tokens[self.PARTS[0]].shape[1]
-        audio_feat = self.audio_encoder(audio, target_tokens=token_length)
         if audio_feat.shape[1] != token_length:
-            raise ValueError("Audio does not cover the complete token prefix")
+            raise ValueError("Audio/token window lengths do not match")
+        for part in self.PARTS:
+            if past_tokens[part].shape[1] != token_length:
+                raise ValueError(f"{part} history length does not match")
         speaker = self.speaker_embedding(speaker_id).expand(-1, token_length, -1)
         region_features = []
         for part in self.PARTS:
@@ -809,51 +765,59 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             for region_id, part in enumerate(self.PARTS)
         }
 
-    def _token_step(self, audio_feat, speaker_id, past_tokens, cache=None):
-        """Predict one time position, retaining the complete prefix in KV caches."""
-        if cache is None:
-            cache = {
-                "regions": {part: [None] * len(self.region_branches[part]) for part in self.PARTS},
-                "fusion": [None] * len(self.fusion),
-            }
-        speaker = self.speaker_embedding(speaker_id)
-        regions = {}
-        features = []
-        for part in self.PARTS:
-            x = self.token_embedding[part](past_tokens[part]) + speaker
-            regions[part] = []
-            for block, block_cache in zip(self.region_branches[part], cache["regions"][part]):
-                x, block_cache = block.forward_step(x, audio_feat, block_cache)
-                regions[part].append(block_cache)
-            features.append(x)
-        h = torch.stack(features, dim=2)
-        fusion = []
-        for block, block_cache in zip(self.fusion, cache["fusion"]):
-            h, block_cache = block.forward_step(h, audio_feat, block_cache)
-            fusion.append(block_cache)
-        logits = {
-            f"cls_{part}": self.heads[part](h[:, :, region_id])
-            for region_id, part in enumerate(self.PARTS)
+    def forward(self, audio, speaker_id, past_tokens):
+        """Teacher forcing with the same bounded window used at inference.
+
+        Position j predicts the j-th target from the right-shifted token at j
+        and earlier tokens in the current window. For startup positions shorter
+        than the window, BOS remains in the prefix. Once enough history exists,
+        every prediction is recomputed from exactly the latest W previous motion
+        tokens and the aligned latest W causal audio tokens.
+        """
+        token_length = past_tokens[self.PARTS[0]].shape[1]
+        audio_feat = self.audio_encoder(audio, target_tokens=token_length)
+        if audio_feat.shape[1] != token_length:
+            raise ValueError("Audio does not cover the complete token prefix")
+
+        window = min(self.history_window_tokens, token_length)
+        prefix_logits = self._predict_window(
+            audio_feat[:, :window], speaker_id,
+            {part: tokens[:, :window] for part, tokens in past_tokens.items()},
+        )
+        if token_length <= window:
+            return prefix_logits
+
+        bs = audio_feat.shape[0]
+        n_tail = token_length - window
+        audio_windows = audio_feat.unfold(1, window, 1)[:, 1:].permute(0, 1, 3, 2)
+        audio_windows = audio_windows.reshape(bs * n_tail, window, audio_feat.shape[-1])
+        token_windows = {
+            part: tokens.unfold(1, window, 1)[:, 1:].reshape(bs * n_tail, window)
+            for part, tokens in past_tokens.items()
         }
-        return logits, {"regions": regions, "fusion": fusion}
+        speaker_windows = speaker_id[:, None].expand(bs, n_tail, speaker_id.shape[1]).reshape(bs * n_tail, speaker_id.shape[1])
+        tail_logits = self._predict_window(audio_windows, speaker_windows, token_windows)
+
+        logits = {}
+        for part in self.PARTS:
+            key = f"cls_{part}"
+            tail_last = tail_logits[key][:, -1:].reshape(bs, n_tail, -1)
+            logits[key] = torch.cat((prefix_logits[key], tail_last), dim=1)
+        return logits
 
     @torch.no_grad()
     def stream_step(self, audio_chunk, speaker_id, state=None, motion_vq=None):
         """Consume new mono samples (B, samples); return ready blocks and state.
 
-        Each result contains one token per region and, when motion_vq is supplied,
-        exactly token_downsample_factor decoded frames. Pass the returned state
-        into the next call. A new utterance starts with state=None.
-
-        Block B1 starts at frame 4 (for factor=4), after receiving audio B0.
-        start_frame/end_frame are on the original audio timeline. In eval mode,
-        cached inference matches a full causal-prefix forward pass.
+        Motion-token history is bounded to history_window_tokens. The audio
+        encoder keeps its own causal signal-processing state; the transformer
+        only sees the latest aligned audio-token window for each prediction.
         """
         if self.training:
             raise RuntimeError("Call model.eval() before streaming inference")
         if state is None:
             state = {
-                "audio": None, "attention": None, "decoder": None, "step": 0,
+                "audio": None, "audio_features": None, "decoder": None, "step": 0,
                 "tokens": {
                     part: torch.full((audio_chunk.shape[0], 1), self.bos_id,
                                      dtype=torch.long, device=audio_chunk.device)
@@ -863,10 +827,17 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
         audio_tokens, audio_state = self.audio_encoder.forward_stream(audio_chunk, state["audio"])
         state = dict(state, audio=audio_state)
         results = []
+        window = self.history_window_tokens
         for i in range(audio_tokens.shape[1]):
-            logits, attention = self._token_step(
-                audio_tokens[:, i:i + 1], speaker_id, state["tokens"], state["attention"]
-            )
+            new_audio = audio_tokens[:, i:i + 1]
+            if state["audio_features"] is None:
+                audio_features = new_audio
+            else:
+                audio_features = torch.cat((state["audio_features"], new_audio), dim=1)
+                audio_features = audio_features[:, -window:]
+            current_tokens = {part: tokens[:, -audio_features.shape[1]:] for part, tokens in state["tokens"].items()}
+            logits = self._predict_window(audio_features, speaker_id, current_tokens)
+            logits = {key: value[:, -1:] for key, value in logits.items()}
             indices = {part: logits[f"cls_{part}"].argmax(dim=-1) for part in self.PARTS}
             start_frame = (state["step"] + 1) * self.cfg.token_downsample_factor
             result = {
@@ -876,9 +847,15 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             decoder = state["decoder"]
             if motion_vq is not None:
                 result["motion"], decoder = motion_vq.decode_stream(indices, decoder)
+            next_tokens = {
+                part: torch.cat((state["tokens"][part], indices[part]), dim=1)[:, -window:]
+                for part in self.PARTS
+            }
             results.append(result)
-            state = dict(state, attention=attention, decoder=decoder, tokens=indices,
-                         step=state["step"] + 1)
+            state = dict(
+                state, audio_features=audio_features, decoder=decoder,
+                tokens=next_tokens, step=state["step"] + 1,
+            )
         return results, state
 
     def inference_stream(self, audio, speaker_id, motion_vq=None, num_tokens=None):
@@ -920,5 +897,3 @@ class CausalEmageAudioTokenModel(PreTrainedModel):
             audio, speaker_id, motion_vq=motion_vq, num_tokens=num_tokens
         )]
         return {key: torch.cat([chunk[key] for chunk in chunks], dim=1) for key in chunks[0]}
-
-

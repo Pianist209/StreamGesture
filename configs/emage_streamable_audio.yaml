@@ -14,7 +14,10 @@ test_model_path: null
 data:
   name_pyfile: 'datasets.beat2'
   class_name: 'BEAT2DatasetEamge'
-  train_bs: 128
+  train_bs: 2
+  # Recompose the shipped overlapping 64-frame manifest into longer clips.
+  # 256 frames -> 63 autoregressive token targets when token_downsample_factor=4.
+  rewindow_stride: 20
   meta_paths:
     - './datasets/data_json/beat2_s20_l64_speaker2.json'
   test_meta_paths:
@@ -25,7 +28,7 @@ model:
   name_pyfile: 'models.emage_audio.modeling_emage_audio'
   class_name: 'CausalEmageAudioTokenModel'
   pose_fps: 30
-  pose_length: 64
+  pose_length: 256
   pose_dims: 330
   joint_mask: null
   audio_sr: 16000
@@ -35,6 +38,7 @@ model:
   vae_codebook_size: 1024
   audio_encoder: causal_mel
   token_downsample_factor: 4
+  history_window_tokens: 32
   num_heads: 4
   region_transformer_layers: 2
   fusion_layers: 2
